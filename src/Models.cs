@@ -73,6 +73,9 @@ namespace Nefdev.PptToPptx
         public long? MarginRight { get; set; }
         public long? MarginBottom { get; set; }
         
+        // Animation
+        public ShapeAnimation Animation { get; set; }
+        
         public Shape()
         {
             Paragraphs = new List<TextParagraph>();
@@ -239,5 +242,14 @@ namespace Nefdev.PptToPptx
         public string Accent { get; set; } = "0000FF";
         public string AccentAndHyperlink { get; set; } = "0000FF";
         public string AccentAndFollowingHyperlink { get; set; } = "800080";
+    }
+
+    public class ShapeAnimation
+    {
+        public string Type { get; set; } = "none"; // "fly", "wipe", "fade", etc.
+        public string Direction { get; set; } = "none";
+        public bool TriggerOnClick { get; set; } = true;
+        public int Order { get; set; } = 0;
+        public int DurationMs { get; set; } = 500;
     }
 }

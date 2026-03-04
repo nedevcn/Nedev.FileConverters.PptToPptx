@@ -408,10 +408,112 @@ namespace Nefdev.PptToPptx
                 WriteTransitionXml(writer, slide.Transition);
             }
             
+            // 写入形状动画
+            WriteTiming(writer, slide);
+            
             writer.WriteEndElement(); // sld
             writer.WriteEndDocument();
         }
-        
+
+        private void WriteTiming(XmlWriter writer, Slide slide)
+        {
+            var animatedShapes = slide.Shapes.Where(s => s.Animation != null && s.Animation.Type != "none").OrderBy(s => s.Animation.Order).ToList();
+            if (animatedShapes.Count == 0) return;
+
+            writer.WriteStartElement("p", "timing", NS_P);
+            writer.WriteStartElement("p", "tnLst", NS_P);
+            writer.WriteStartElement("p", "par", NS_P);
+            
+            // Root Time Node
+            writer.WriteStartElement("p", "cTn", NS_P);
+            writer.WriteAttributeString("id", "1");
+            writer.WriteAttributeString("dur", "indefinite");
+            writer.WriteAttributeString("restart", "never");
+            writer.WriteAttributeString("nodeType", "tmRoot");
+            
+            writer.WriteStartElement("p", "childTnLst", NS_P);
+            writer.WriteStartElement("p", "seq", NS_P);
+            writer.WriteAttributeString("concurrent", "1");
+            writer.WriteAttributeString("nextAc", "seek");
+            
+            writer.WriteStartElement("p", "cTn", NS_P);
+            writer.WriteAttributeString("id", "2");
+            writer.WriteAttributeString("dur", "indefinite");
+            writer.WriteAttributeString("nodeType", "mainSeq");
+            
+            writer.WriteStartElement("p", "childTnLst", NS_P);
+            
+            int tnId = 3;
+            foreach (var shape in animatedShapes)
+            {
+                int shapeId = slide.Shapes.IndexOf(shape) + 2; // Match shapeId in WriteSlideXml
+                var anim = shape.Animation;
+
+                writer.WriteStartElement("p", "par", NS_P);
+                writer.WriteStartElement("p", "cTn", NS_P);
+                writer.WriteAttributeString("id", (tnId++).ToString());
+                writer.WriteAttributeString("fill", "hold");
+                writer.WriteAttributeString("nodeType", anim.TriggerOnClick ? "clickEffect" : "withPrevious");
+                
+                writer.WriteStartElement("p", "stCondLst", NS_P);
+                writer.WriteStartElement("p", "cond", NS_P);
+                writer.WriteAttributeString("delay", "0");
+                writer.WriteEndElement();
+                writer.WriteEndElement();
+
+                writer.WriteStartElement("p", "childTnLst", NS_P);
+                
+                // Entrance Effect
+                writer.WriteStartElement("p", "anim", NS_P);
+                writer.WriteAttributeString("calcmode", "lin");
+                writer.WriteAttributeString("valueType", "num");
+                
+                writer.WriteStartElement("p", "cTn", NS_P);
+                writer.WriteAttributeString("id", (tnId++).ToString());
+                writer.WriteAttributeString("dur", anim.DurationMs.ToString());
+                writer.WriteAttributeString("fill", "hold");
+
+                // Target
+                writer.WriteStartElement("p", "stTarget", NS_P);
+                writer.WriteStartElement("p", "spTarget", NS_P);
+                writer.WriteAttributeString("spid", shapeId.ToString());
+                writer.WriteEndElement();
+                writer.WriteEndElement();
+
+                writer.WriteEndElement(); // cTn
+                writer.WriteEndElement(); // anim
+
+                writer.WriteEndElement(); // childTnLst
+                writer.WriteEndElement(); // cTn
+                writer.WriteEndElement(); // par
+            }
+
+            writer.WriteEndElement(); // childTnLst (mainSeq)
+            writer.WriteEndElement(); // cTn (mainSeq)
+            
+            writer.WriteStartElement("p", "prevCondLst", NS_P);
+            writer.WriteStartElement("p", "cond", NS_P);
+            writer.WriteAttributeString("evt", "onPrev");
+            writer.WriteAttributeString("delay", "0");
+            writer.WriteEndElement();
+            writer.WriteEndElement();
+            
+            writer.WriteStartElement("p", "nextCondLst", NS_P);
+            writer.WriteStartElement("p", "cond", NS_P);
+            writer.WriteAttributeString("evt", "onNext");
+            writer.WriteAttributeString("delay", "0");
+            writer.WriteEndElement();
+            writer.WriteEndElement();
+            
+            writer.WriteEndElement(); // seq
+            writer.WriteEndElement(); // childTnLst (tmRoot)
+            
+            writer.WriteEndElement(); // cTn (tmRoot)
+            writer.WriteEndElement(); // par
+            writer.WriteEndElement(); // tnLst
+            writer.WriteEndElement(); // timing
+        }
+
         private void WriteTransitionXml(XmlWriter writer, SlideTransition transition)
         {
             writer.WriteStartElement("p", "transition", NS_P);

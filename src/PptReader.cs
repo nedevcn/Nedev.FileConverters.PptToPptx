@@ -48,6 +48,8 @@ namespace Nefdev.PptToPptx
         private const ushort RT_InteractiveInfoAtom = 4083;
         private const ushort RT_TextInteractiveInfoAtom = 4084;
         private const ushort RT_CString = 4056;
+        private const ushort RT_AnimationInfoContainer = 4072;
+        private const ushort RT_AnimationInfoAtom = 4073;
         
         // OLE / ExObj records
         private const ushort RT_ExObjRefAtom = 3009;   // Links shape to exObjId
@@ -1287,6 +1289,9 @@ namespace Nefdev.PptToPptx
                         
                         // Check for Programmable Tags (Table detection)
                         ParseProgTags(data, atomStart, (int)header.RecLen, shape);
+
+                        // Check for Animation Info
+                        ParseAnimationInfo(data, atomStart, (int)header.RecLen, shape);
                         break;
                 }
                 
@@ -1405,6 +1410,72 @@ namespace Nefdev.PptToPptx
             
             slide.Transition = transition;
             Console.WriteLine($"Parsed Slide Transition: {transition.Type}, speed={transition.Speed}, autoAdvance={transition.HasAutoAdvance} ({transition.AdvanceTime}ms)");
+        }
+
+        private void ParseAnimationInfo(byte[] data, int start, int length, Shape shape)
+        {
+            int end = Math.Min(start + length, data.Length);
+            int pos = start;
+
+            while (pos + 8 <= end)
+            {
+                var header = ReadRecordHeader(data, pos);
+                int recordEnd = pos + 8 + (int)header.RecLen;
+                int atomStart = pos + 8;
+
+                if (header.RecType == RT_AnimationInfoContainer)
+                {
+                    ParseAnimationInfo(data, atomStart, (int)header.RecLen, shape);
+                }
+                else if (header.RecType == RT_AnimationInfoAtom && header.RecLen >= 28)
+                {
+                    var anim = new ShapeAnimation();
+                    
+                    // Flags at offset 4 (after dimColor 4 bytes)
+                    // Byte 4: bits for fReverse, fAutomatic, fSound, fStopSound
+                    byte flags1 = data[atomStart + 4];
+                    anim.TriggerOnClick = (flags1 & 0x04) == 0; // fAutomatic is bits 2-3 (0x04 or 0x08?)
+                    // MS-PPT spec says fAutomatic is bit 2-3. 0x01 means automatic.
+                    // Actually fAutomatic is 2 bits at bit index 2.
+                    anim.TriggerOnClick = ((flags1 >> 2) & 0x03) == 0;
+
+                    // orderID is at offset 8 (2 bytes)
+                    anim.Order = BitConverter.ToInt16(data, atomStart + 8);
+
+                    // animEffect is at at offset 11 (1 byte)
+                    byte effect = data[atomStart + 11];
+                    // animEffectDirection is at offset 12 (1 byte)
+                    byte direction = data[atomStart + 12];
+
+                    anim.Type = effect switch
+                    {
+                        0x01 => "fly", // Fly
+                        0x0D => "fade", // Appear/Fade? 0x0D is often Appear
+                        0x02 => "fly", // Fly
+                        0x03 => "fly", // Fly
+                        0x04 => "fly", // Fly
+                        0x08 => "wipe", // Wipe
+                        0x0C => "dissolve", // Dissolve
+                        0x10 => "zoom", // Zoom
+                        _ => "fade"
+                    };
+
+                    anim.Direction = direction switch
+                    {
+                        0x00 => "l", // Left
+                        0x01 => "t", // Top
+                        0x02 => "r", // Right
+                        0x03 => "b", // Bottom
+                        _ => "none"
+                    };
+
+                    shape.Animation = anim;
+                    Console.WriteLine($"Parsed Animation for shape: type={anim.Type}, order={anim.Order}, triggerOnClick={anim.TriggerOnClick}");
+                }
+
+                pos = recordEnd;
+                if (pos <= start) break;
+            }
         }
 
         private void ParseProgTags(byte[] data, int start, int length, Shape shape)
