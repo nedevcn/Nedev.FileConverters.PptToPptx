@@ -73,6 +73,9 @@ namespace Nefdev.PptToPptx
         public long? MarginRight { get; set; }
         public long? MarginBottom { get; set; }
         
+        // Geometry
+        public ShapeGeometry Geometry { get; set; }
+        
         // Animation
         public ShapeAnimation Animation { get; set; }
         
@@ -251,5 +254,33 @@ namespace Nefdev.PptToPptx
         public bool TriggerOnClick { get; set; } = true;
         public int Order { get; set; } = 0;
         public int DurationMs { get; set; } = 500;
+    }
+
+    public class ShapeGeometry
+    {
+        public long GeoLeft { get; set; } = 0;
+        public long GeoTop { get; set; } = 0;
+        public long GeoRight { get; set; } = 21600;
+        public long GeoBottom { get; set; } = 21600;
+        public List<GeometryPath> Paths { get; set; } = new List<GeometryPath>();
+    }
+
+    public class GeometryPath
+    {
+        public long Width { get; set; } = 21600;
+        public long Height { get; set; } = 21600;
+        public List<GeometryCommand> Commands { get; set; } = new List<GeometryCommand>();
+    }
+
+    public class GeometryCommand
+    {
+        public string Type { get; set; } // "moveTo", "lnTo", "arcTo", "cubicBezTo", "close"
+        public List<GeometryPoint> Points { get; set; } = new List<GeometryPoint>();
+    }
+
+    public struct GeometryPoint
+    {
+        public long X { get; set; }
+        public long Y { get; set; }
     }
 }

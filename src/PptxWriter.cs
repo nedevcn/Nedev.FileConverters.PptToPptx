@@ -626,11 +626,18 @@ namespace Nefdev.PptToPptx
             writer.WriteEndElement();
             writer.WriteEndElement(); // xfrm
             
-            writer.WriteStartElement("a", "prstGeom", NS_A);
-            writer.WriteAttributeString("prst", "rect");
-            writer.WriteStartElement("a", "avLst", NS_A);
-            writer.WriteEndElement();
-            writer.WriteEndElement(); // prstGeom
+            if (shape.Geometry != null && shape.Geometry.Paths.Count > 0)
+            {
+                WriteCustomGeometry(writer, shape.Geometry);
+            }
+            else
+            {
+                writer.WriteStartElement("a", "prstGeom", NS_A);
+                writer.WriteAttributeString("prst", "rect");
+                writer.WriteStartElement("a", "avLst", NS_A);
+                writer.WriteEndElement();
+                writer.WriteEndElement(); // prstGeom
+            }
             
             // 填充颜色
             if (!string.IsNullOrEmpty(shape.FillColor))
@@ -702,6 +709,85 @@ namespace Nefdev.PptToPptx
             writer.WriteEndElement(); // txBody
             
             writer.WriteEndElement(); // sp
+        }
+
+        private void WriteCustomGeometry(XmlWriter writer, ShapeGeometry geometry)
+        {
+            writer.WriteStartElement("a", "custGeom", NS_A);
+            writer.WriteStartElement("a", "avLst", NS_A);
+            writer.WriteEndElement();
+            writer.WriteStartElement("a", "gdLst", NS_A);
+            writer.WriteEndElement();
+            writer.WriteStartElement("a", "ahLst", NS_A);
+            writer.WriteEndElement();
+            writer.WriteStartElement("a", "cxnLst", NS_A);
+            writer.WriteEndElement();
+            
+            writer.WriteStartElement("a", "rect", NS_A);
+            writer.WriteAttributeString("l", "0");
+            writer.WriteAttributeString("t", "0");
+            writer.WriteAttributeString("r", "0");
+            writer.WriteAttributeString("b", "0");
+            writer.WriteEndElement();
+            
+            writer.WriteStartElement("a", "pathLst", NS_A);
+            foreach (var path in geometry.Paths)
+            {
+                writer.WriteStartElement("a", "path", NS_A);
+                writer.WriteAttributeString("w", Math.Max(1, geometry.GeoRight - geometry.GeoLeft).ToString());
+                writer.WriteAttributeString("h", Math.Max(1, geometry.GeoBottom - geometry.GeoTop).ToString());
+                
+                foreach (var cmd in path.Commands)
+                {
+                    switch (cmd.Type)
+                    {
+                        case "moveTo":
+                            if (cmd.Points.Count > 0)
+                            {
+                                writer.WriteStartElement("a", "moveTo", NS_A);
+                                WritePoint(writer, cmd.Points[0]);
+                                writer.WriteEndElement();
+                            }
+                            break;
+                        case "lnTo":
+                            foreach (var pt in cmd.Points)
+                            {
+                                writer.WriteStartElement("a", "lnTo", NS_A);
+                                WritePoint(writer, pt);
+                                writer.WriteEndElement();
+                            }
+                            break;
+                        case "cubicBezTo":
+                            for (int i = 0; i < cmd.Points.Count; i += 3)
+                            {
+                                if (i + 2 < cmd.Points.Count)
+                                {
+                                    writer.WriteStartElement("a", "cubicBezTo", NS_A);
+                                    WritePoint(writer, cmd.Points[i]);
+                                    WritePoint(writer, cmd.Points[i + 1]);
+                                    WritePoint(writer, cmd.Points[i + 2]);
+                                    writer.WriteEndElement();
+                                }
+                            }
+                            break;
+                        case "close":
+                            writer.WriteStartElement("a", "close", NS_A);
+                            writer.WriteEndElement();
+                            break;
+                    }
+                }
+                writer.WriteEndElement(); // path
+            }
+            writer.WriteEndElement(); // pathLst
+            writer.WriteEndElement(); // custGeom
+        }
+
+        private void WritePoint(XmlWriter writer, GeometryPoint pt)
+        {
+            writer.WriteStartElement("a", "pt", NS_A);
+            writer.WriteAttributeString("x", pt.X.ToString());
+            writer.WriteAttributeString("y", pt.Y.ToString());
+            writer.WriteEndElement();
         }
 
         private void WriteGraphicFrame(XmlWriter writer, Shape shape, int shapeId)

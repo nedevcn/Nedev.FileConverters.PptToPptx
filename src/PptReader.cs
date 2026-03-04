@@ -1269,7 +1269,7 @@ namespace Nefdev.PptToPptx
 
                     case ESCHER_Opt:
                         // Find blip id if this is a picture
-                        ParseEscherOpt(data, atomStart, (int)header.RecLen, shape);
+                        ParseEscherOpt(data, atomStart, (int)header.RecLen, shape, (ushort)header.RecInstance);
                         break;
                         
                     case ESCHER_ClientData:
@@ -1716,77 +1716,193 @@ namespace Nefdev.PptToPptx
             return shapes;
         }
 
-        private void ParseEscherOpt(byte[] data, int start, int length, Shape shape)
+        private void ParseEscherOpt(byte[] data, int start, int length, Shape shape, ushort propCount)
         {
-            int end = Math.Min(start + length, data.Length);
-            int pos = start;
-            
-            while (pos + 6 <= end)
+            int propTableSize = propCount * 6;
+            int complexDataStart = start + propTableSize;
+            int currentComplexOffset = 0;
+
+            byte[] vData = null; int vOffset = 0, vLen = 0;
+            byte[] sData = null; int sOffset = 0, sLen = 0;
+
+            for (int i = 0; i < propCount; i++)
             {
-                ushort propId = BitConverter.ToUInt16(data, pos);
-                uint propValue = BitConverter.ToUInt32(data, pos + 2);
-                pos += 6;
-                
+                int entryPos = start + (i * 6);
+                if (entryPos + 6 > data.Length) break;
+
+                ushort propId = BitConverter.ToUInt16(data, entryPos);
+                uint propValue = BitConverter.ToUInt32(data, entryPos + 2);
+
                 int pid = propId & 0x3FFF;
                 bool isComplex = (propId & 0x8000) != 0;
-                
-                switch (pid)
+
+                if (isComplex)
                 {
-                    case 0x0104: // pib (Picture Blip ID)
-                        shape.ImageId = (int)propValue;
-                        shape.Type = "Picture";
-                        break;
-                    case 0x0181: // fillColor
-                        // BGR format in Escher
-                        byte fb = (byte)(propValue & 0xFF);
-                        byte fg = (byte)((propValue >> 8) & 0xFF);
-                        byte fr = (byte)((propValue >> 16) & 0xFF);
-                        shape.FillColor = $"{fr:X2}{fg:X2}{fb:X2}";
-                        break;
-                    case 0x01BF: // fNoFillHitTest (fill style bool props)
-                        // Bit 4 (0x10): fFilled
-                        if ((propValue & 0x10) == 0)
-                            shape.FillColor = null; // no fill
-                        break;
-                    case 0x01C0: // lineColor
-                        byte lb = (byte)(propValue & 0xFF);
-                        byte lg = (byte)((propValue >> 8) & 0xFF);
-                        byte lr = (byte)((propValue >> 16) & 0xFF);
-                        shape.LineColor = $"{lr:X2}{lg:X2}{lb:X2}";
-                        break;
-                    case 0x01C3: // fNoLine (line style bool props)
-                        // Bit 3 (0x08): fLine
-                        if ((propValue & 0x08) == 0)
-                            shape.LineColor = null;
-                        break;
-                        
-                    // Text layout properties
-                    case 0x0081: // dyTextTop
-                        shape.MarginTop = (long)propValue;
-                        break;
-                    case 0x0082: // dyTextBottom
-                        shape.MarginBottom = (long)propValue;
-                        break;
-                    case 0x0083: // dxTextLeft
-                        shape.MarginLeft = (long)propValue;
-                        break;
-                    case 0x0084: // dxTextRight
-                        shape.MarginRight = (long)propValue;
-                        break;
-                    case 0x0085: // anchorText
-                        switch (propValue)
-                        {
-                            case 0: shape.VerticalAlignment = "t"; break; // Top
-                            case 1: shape.VerticalAlignment = "ctr"; break; // Middle
-                            case 2: shape.VerticalAlignment = "b"; break; // Bottom
-                            case 3: shape.VerticalAlignment = "t"; break; // Top Centered
-                            case 4: shape.VerticalAlignment = "ctr"; break; // Middle Centered
-                            case 5: shape.VerticalAlignment = "b"; break; // Bottom Centered
-                            default: shape.VerticalAlignment = "t"; break;
-                        }
-                        break;
+                    int dataLen = (int)propValue;
+                    int dataOffset = complexDataStart + currentComplexOffset;
+                    if (dataOffset + dataLen <= data.Length)
+                    {
+                        if (pid == 325) { vData = data; vOffset = dataOffset; vLen = dataLen; }
+                        else if (pid == 326) { sData = data; sOffset = dataOffset; sLen = dataLen; }
+                        else HandleComplexProperty(pid, data, dataOffset, dataLen, shape);
+                    }
+                    currentComplexOffset += dataLen;
+                }
+                else
+                {
+                    HandleSimpleProperty(pid, propValue, shape);
                 }
             }
+            
+            if (vData != null || sData != null)
+            {
+                BuildCustomGeometry(vData, vOffset, vLen, sData, sOffset, sLen, shape);
+            }
+        }
+
+        private void HandleSimpleProperty(int pid, uint propValue, Shape shape)
+        {
+            switch (pid)
+            {
+                case 0x0104: // pib (Picture Blip ID)
+                    shape.ImageId = (int)propValue;
+                    shape.Type = "Picture";
+                    break;
+                case 0x0181: // fillColor
+                    byte fb = (byte)(propValue & 0xFF);
+                    byte fg = (byte)((propValue >> 8) & 0xFF);
+                    byte fr = (byte)((propValue >> 16) & 0xFF);
+                    shape.FillColor = $"{fr:X2}{fg:X2}{fb:X2}";
+                    break;
+                case 0x01BF: // fNoFillHitTest
+                    if ((propValue & 0x10) == 0) shape.FillColor = null;
+                    break;
+                case 0x01C0: // lineColor
+                    byte lb = (byte)(propValue & 0xFF);
+                    byte lg = (byte)((propValue >> 8) & 0xFF);
+                    byte lr = (byte)((propValue >> 16) & 0xFF);
+                    shape.LineColor = $"{lr:X2}{lg:X2}{lb:X2}";
+                    break;
+                case 0x01C3: // fNoLine
+                    if ((propValue & 0x08) == 0) shape.LineColor = null;
+                    break;
+                case 0x0081: // dyTextTop
+                    shape.MarginTop = (long)propValue;
+                    break;
+                case 0x0082: // dyTextBottom
+                    shape.MarginBottom = (long)propValue;
+                    break;
+                case 0x0083: // dxTextLeft
+                    shape.MarginLeft = (long)propValue;
+                    break;
+                case 0x0084: // dxTextRight
+                    shape.MarginRight = (long)propValue;
+                    break;
+                case 0x0085: // anchorText
+                    shape.VerticalAlignment = propValue switch
+                    {
+                        0 or 3 => "t",
+                        1 or 4 => "ctr",
+                        2 or 5 => "b",
+                        _ => "t"
+                    };
+                    break;
+                
+                // Geometry simple props
+                case 320: if (shape.Geometry == null) shape.Geometry = new ShapeGeometry(); shape.Geometry.GeoLeft = (int)propValue; break;
+                case 321: if (shape.Geometry == null) shape.Geometry = new ShapeGeometry(); shape.Geometry.GeoTop = (int)propValue; break;
+                case 322: if (shape.Geometry == null) shape.Geometry = new ShapeGeometry(); shape.Geometry.GeoRight = (int)propValue; break;
+                case 323: if (shape.Geometry == null) shape.Geometry = new ShapeGeometry(); shape.Geometry.GeoBottom = (int)propValue; break;
+            }
+        }
+
+        private void HandleComplexProperty(int pid, byte[] data, int offset, int length, Shape shape)
+        {
+            // Placeholder for other complex properties like pSegmentInfo if needed elsewhere
+        }
+
+        private List<byte[]> ParseIMsoArray(byte[] data, int offset, int length, int cbItemSize)
+        {
+            var items = new List<byte[]>();
+            if (length < 6) return items;
+
+            ushort nItems = BitConverter.ToUInt16(data, offset);
+            ushort nItemsMax = BitConverter.ToUInt16(data, offset + 2);
+            ushort cbItem = BitConverter.ToUInt16(data, offset + 4);
+
+            int pos = offset + 6;
+            for (int i = 0; i < nItems; i++)
+            {
+                if (pos + cbItem > data.Length) break;
+                byte[] item = new byte[cbItem];
+                Array.Copy(data, pos, item, 0, cbItem);
+                items.Add(item);
+                pos += cbItem;
+            }
+            return items;
+        }
+
+        private void BuildCustomGeometry(byte[]? vData, int vOffset, int vLen, byte[]? sData, int sOffset, int sLen, Shape shape)
+        {
+            if (shape.Geometry == null) shape.Geometry = new ShapeGeometry();
+            
+            var vertices = vData != null ? ParseIMsoArray(vData, vOffset, vLen, 8) : new List<byte[]>();
+            var segments = sData != null ? ParseIMsoArray(sData, sOffset, sLen, 2) : new List<byte[]>();
+
+            var path = new GeometryPath();
+            int vIndex = 0;
+
+            foreach (var sBytes in segments)
+            {
+                ushort sVal = BitConverter.ToUInt16(sBytes, 0);
+                int cmd = sVal >> 13;
+                int count = sVal & 0x1FFF;
+
+                var command = new GeometryCommand();
+                switch (cmd)
+                {
+                    case 0: command.Type = "moveTo"; break;
+                    case 1: command.Type = "lnTo"; break;
+                    case 2: command.Type = "cubicBezTo"; break;
+                    case 3: command.Type = "close"; break;
+                    case 4: command.Type = "none"; break; // End
+                    default: command.Type = "lnTo"; break;
+                }
+
+                if (command.Type != "none")
+                {
+                    for (int j = 0; j < count; j++)
+                    {
+                        if (vIndex < vertices.Count)
+                        {
+                            var vBytes = vertices[vIndex++];
+                            command.Points.Add(new GeometryPoint
+                            {
+                                X = BitConverter.ToInt32(vBytes, 0),
+                                Y = BitConverter.ToInt32(vBytes, 4)
+                            });
+                        }
+                    }
+                    path.Commands.Add(command);
+                }
+            }
+            
+            // If segments is empty, it's a simple polygon
+            if (segments.Count == 0 && vertices.Count > 0)
+            {
+                for (int i = 0; i < vertices.Count; i++)
+                {
+                    var vBytes = vertices[i];
+                    path.Commands.Add(new GeometryCommand {
+                        Type = (i == 0) ? "moveTo" : "lnTo",
+                        Points = new List<GeometryPoint> {
+                            new GeometryPoint { X = BitConverter.ToInt32(vBytes, 0), Y = BitConverter.ToInt32(vBytes, 4) }
+                        }
+                    });
+                }
+            }
+
+            shape.Geometry.Paths.Add(path);
         }
         
         private void ParseClientTextbox(byte[] data, int start, int length, Shape shape)
