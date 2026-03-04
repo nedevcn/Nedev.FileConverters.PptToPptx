@@ -1,0 +1,1653 @@
+using System;
+using System.IO;
+using System.Linq;
+using System.Text;
+using System.Collections.Generic;
+
+namespace Nefdev.PptToPptx
+{
+    public class PptReader : IDisposable
+    {
+        private static bool _encodingRegistered = false;
+        private readonly Stream _stream;
+        private byte[] _picturesData;
+        private OleCompoundFile _oleFile;
+        
+        // exObjId → OLE storage name (e.g., "_1326458456")
+        private Dictionary<int, string> _exOleObjMap = new Dictionary<int, string>();
+        
+        // PPT Record type constants
+        private const ushort RT_Document = 1000;
+        private const ushort RT_Slide = 1006;
+        private const ushort RT_SlideListWithText = 1008;
+        private const ushort RT_SlidePersistAtom = 1011;
+        private const ushort RT_TextCharsAtom = 4000;  // 0x0FA0 — Unicode text
+        private const ushort RT_TextBytesAtom = 4008;  // 0x0FA8 — ANSI text
+        private const ushort RT_StyleTextPropAtom = 4001;
+        private const ushort RT_TextHeaderAtom = 3999;  // 0x0F9F
+        private const ushort RT_UserEditAtom = 4085;  // 0x0FF5
+        private const ushort RT_PersistDirectoryAtom = 6002;  // 0x1772
+        private const ushort RT_CurrentUserAtom = 4086;
+        private const ushort RT_SlideAtom = 1007;
+        private const ushort RT_DocumentAtom = 1001;
+        private const ushort RT_Environment = 1010;
+        private const ushort RT_FontCollection = 2005;
+        private const ushort RT_FontEntityAtom = 4023;
+        
+        // Hyperlink records
+        private const ushort RT_ExObjList = 1033;
+        private const ushort RT_ExHyperlink = 4055;
+        private const ushort RT_ExHyperlinkAtom = 4051;
+        private const ushort RT_InteractiveInfo = 4082;
+        private const ushort RT_InteractiveInfoAtom = 4083;
+        private const ushort RT_TextInteractiveInfoAtom = 4084;
+        private const ushort RT_CString = 4056;
+        
+        // OLE / ExObj records
+        private const ushort RT_ExObjRefAtom = 3009;   // Links shape to exObjId
+        private const ushort RT_ExOleObjStg = 4113;    // OLE Object storage reference
+        private const ushort RT_ExOleObjAtom = 4035;   // OLE Object atom with exObjId and storage name
+        private const ushort RT_ExEmbed = 4044;        // ExEmbed container
+        private const ushort RT_ExOleEmbed = 4034;     // ExOleEmbed container
+        private const ushort RT_ExOleLink = 4036;      // ExOleLink container
+        private const ushort RT_ExObjListAtom = 1034;  // ExObjList atom
+        
+        // Escher record types
+        private const ushort ESCHER_DggContainer = 0xF000;
+        private const ushort ESCHER_BStoreContainer = 0xF001;
+        private const ushort ESCHER_DgContainer = 0xF002;
+        private const ushort ESCHER_SpgrContainer = 0xF003;
+        private const ushort ESCHER_SpContainer = 0xF004;
+        private const ushort ESCHER_Sp = 0xF00A;
+        private const ushort ESCHER_ClientTextbox = 0xF00D;
+        private const ushort ESCHER_ClientData = 0xF011;
+        private const ushort ESCHER_ClientAnchor = 0xF010;
+        private const ushort ESCHER_ChildAnchor = 0xF00F;
+        private const ushort ESCHER_Opt = 0xF00B;
+        private const ushort ESCHER_BlipFirst = 0xF018;
+        private const ushort ESCHER_BlipLast = 0xF117;
+        
+        private Dictionary<int, ImageResource> _blipMap = new Dictionary<int, ImageResource>();
+        private List<string> _fontTable = new List<string>();
+        private Dictionary<int, string> _hyperlinkMap = new Dictionary<int, string>();
+
+        public PptReader(string path)
+        {
+            _stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
+        }
+        
+        public Presentation ReadPresentation()
+        {
+            if (!_encodingRegistered)
+            {
+                Encoding.RegisterProvider(CodePagesEncodingProvider.Instance);
+                _encodingRegistered = true;
+            }
+            
+            var presentation = new Presentation();
+            
+            // 使用 OLE Compound File 解析器
+            _oleFile = new OleCompoundFile(_stream);
+            var oleFile = _oleFile;
+            oleFile.Parse();
+            
+            // 读取 PowerPoint 文档流
+            var pptStream = oleFile.GetStream("PowerPoint Document");
+            if (pptStream != null)
+            {
+                using (pptStream)
+                {
+                    byte[] pptData = ReadAllBytes(pptStream);
+                    
+                    // 先尝试通过 Current User 找到 UserEdit 链
+                    int userEditOffset = -1;
+                    var currentUserStream = oleFile.GetStream("Current User");
+                    if (currentUserStream != null)
+                    {
+                        using (currentUserStream)
+                        {
+                            userEditOffset = ReadCurrentUser(currentUserStream);
+                        }
+                    }
+                    
+                    // 读取 Persist 映射表
+                    var persistDirectory = BuildPersistDirectory(pptData, userEditOffset);
+                    
+                    // 读取 Pictures 流
+                    var picturesStream = oleFile.GetStream("Pictures");
+                    if (picturesStream != null)
+                    {
+                        using (picturesStream)
+                        {
+                            _picturesData = ReadAllBytes(picturesStream);
+                            Console.WriteLine($"Read Pictures stream, size: {_picturesData.Length}");
+                        }
+                    }
+
+                    // 提取所有全局超链接
+                    GlobalScanForHyperlinks(pptData);
+
+                    // 解析 Document 和 Slides
+                    ParsePptData(pptData, presentation, persistDirectory);
+                    
+                    // 将 blipMap 中的图片添加到 Presentation
+                    presentation.Images.AddRange(_blipMap.Values);
+                }
+            }
+            
+            // 如果没有解析到任何幻灯片，尝试直接扫描
+            if (presentation.Slides.Count == 0)
+            {
+                var pptStream2 = oleFile.GetStream("PowerPoint Document");
+                if (pptStream2 != null)
+                {
+                    using (pptStream2)
+                    {
+                        byte[] pptData = ReadAllBytes(pptStream2);
+                        DirectScanForSlides(pptData, presentation);
+                    }
+                }
+            }
+            
+            // 读取 VBA 项目
+            presentation.VbaProject = ReadVbaProject(oleFile);
+
+            Console.WriteLine($"ReadPresentation complete. Total slides: {presentation.Slides.Count}, Total images: {presentation.Images.Count}");
+            return presentation;
+        }
+
+        private int ReadCurrentUser(Stream stream)
+        {
+            byte[] data = ReadAllBytes(stream);
+            if (data.Length < 20) return -1;
+            // CurrentUserAtom header is 8 bytes. offsetToCurrentEdit is at byte 16 (8+8)
+            return BitConverter.ToInt32(data, 16);
+        }
+
+        private Dictionary<int, int> BuildPersistDirectory(byte[] data, int lastUserEditOffset)
+        {
+            var persistMap = new Dictionary<int, int>();
+            int currentOffset = lastUserEditOffset;
+
+            while (currentOffset >= 0 && currentOffset < data.Length - 8)
+            {
+                var header = ReadRecordHeader(data, currentOffset);
+                if (header.RecType == RT_UserEditAtom)
+                {
+                    int atomStart = currentOffset + 8;
+                    // PersistPointers offset is at byte 8 of atom
+                    int persistOffset = BitConverter.ToInt32(data, atomStart + 8);
+                    int prevEditOffset = BitConverter.ToInt32(data, atomStart + 4);
+
+                    if (persistOffset >= 0 && persistOffset < data.Length - 8)
+                    {
+                        var pDirHeader = ReadRecordHeader(data, persistOffset);
+                        if (pDirHeader.RecType == RT_PersistDirectoryAtom)
+                        {
+                            ParsePersistDirectory(data, persistOffset + 8, (int)pDirHeader.RecLen, persistMap);
+                        }
+                    }
+                    currentOffset = prevEditOffset;
+                }
+                else
+                {
+                    break;
+                }
+            }
+            return persistMap;
+        }
+
+        private void ParsePersistDirectory(byte[] data, int start, int length, Dictionary<int, int> persistMap)
+        {
+            int end = Math.Min(start + length, data.Length);
+            int pos = start;
+            while (pos + 4 <= end)
+            {
+                uint entry = BitConverter.ToUInt32(data, pos);
+                pos += 4;
+                int count = (int)(entry >> 20);
+                int baseId = (int)(entry & 0xFFFFF);
+
+                for (int i = 0; i < count; i++)
+                {
+                    if (pos + 4 <= end)
+                    {
+                        int offset = BitConverter.ToInt32(data, pos);
+                        persistMap[baseId + i] = offset;
+                        pos += 4;
+                    }
+                }
+            }
+        }
+
+        private void ParsePptData(byte[] data, Presentation presentation, Dictionary<int, int> persistMap)
+        {
+            // Find Document record using persistMap or scan
+            // Typically Document is at persist ID 1
+            if (persistMap.TryGetValue(1, out int docOffset))
+            {
+                var header = ReadRecordHeader(data, docOffset);
+                if (header.RecType == RT_Document)
+                {
+                    ParseDocumentContainer(data, docOffset + 8, (int)header.RecLen, presentation, persistMap);
+                }
+            }
+            else
+            {
+                // Fallback: scan for Document
+                int offset = ScanForRecord(data, RT_Document);
+                if (offset >= 0)
+                {
+                    var header = ReadRecordHeader(data, offset);
+                    ParseDocumentContainer(data, offset + 8, (int)header.RecLen, presentation, persistMap);
+                }
+            }
+        }
+
+        private void ParseDocumentContainer(byte[] data, int start, int length, Presentation presentation, Dictionary<int, int> persistMap)
+        {
+            int end = Math.Min(start + length, data.Length);
+            int pos = start;
+            
+            // 收集 SlidePersistAtom 信息
+            var slidePersistIds = new List<int>();
+            
+            while (pos + 8 <= end)
+            {
+                var header = ReadRecordHeader(data, pos);
+                int recordEnd = pos + 8 + (int)header.RecLen;
+                
+                if (header.RecType == RT_DocumentAtom)
+                {
+                    // DocumentAtom: slideSize(8 bytes) + notesSize(8 bytes) + ...
+                    // slideSize: width(4) + height(4) in master units (1/576 inch)
+                    if (header.RecLen >= 8)
+                    {
+                        int slideW = BitConverter.ToInt32(data, pos + 8);
+                        int slideH = BitConverter.ToInt32(data, pos + 8 + 4);
+                        // Convert master units to EMU: 1 master unit = 12700/8 EMU = 1587.5 EMU
+                        // Actually, DocumentAtom stores in "master units" where 576 units = 1 inch
+                        // EMU: 1 inch = 914400 EMU, so 1 master unit = 914400/576 = 1587.5 EMU
+                        if (slideW > 0 && slideH > 0)
+                        {
+                            presentation.SlideWidth = (int)(slideW * 914400L / 576);
+                            presentation.SlideHeight = (int)(slideH * 914400L / 576);
+                            Console.WriteLine($"Slide size from DocumentAtom: {slideW}x{slideH} master units => {presentation.SlideWidth}x{presentation.SlideHeight} EMU");
+                        }
+                    }
+                }
+                else if (header.RecType == RT_Environment)
+                {
+                    ParseEnvironment(data, pos + 8, (int)header.RecLen);
+                }
+                else if (header.RecType == ESCHER_DggContainer)
+                {
+                    Console.WriteLine($"Found DggContainer at {pos}, len {header.RecLen}");
+                    ParseDrawingGroup(data, pos + 8, (int)header.RecLen);
+                }
+                else if (header.RecType == RT_SlideListWithText)
+                {
+                    ParseSlideListWithText(data, pos + 8, (int)header.RecLen, presentation, persistMap, slidePersistIds);
+                }
+                else if (header.RecType == RT_ExObjList)
+                {
+                    ParseExObjList(data, pos + 8, (int)header.RecLen);
+                }
+                
+                pos = recordEnd;
+                if (pos <= start) break; // 防止无限循环
+            }
+        }
+
+        private void ParseEnvironment(byte[] data, int start, int length)
+        {
+            int end = Math.Min(start + length, data.Length);
+            int pos = start;
+            
+            while (pos + 8 <= end)
+            {
+                var header = ReadRecordHeader(data, pos);
+                int recordEnd = pos + 8 + (int)header.RecLen;
+                
+                if (header.RecType == RT_FontCollection)
+                {
+                    ParseFontCollection(data, pos + 8, (int)header.RecLen);
+                }
+                else if (header.IsContainer)
+                {
+                    ParseEnvironment(data, pos + 8, (int)header.RecLen);
+                }
+                
+                pos = recordEnd;
+                if (pos <= start) break;
+            }
+        }
+        
+        private void ParseFontCollection(byte[] data, int start, int length)
+        {
+            int end = Math.Min(start + length, data.Length);
+            int pos = start;
+            
+            while (pos + 8 <= end)
+            {
+                var header = ReadRecordHeader(data, pos);
+                int atomStart = pos + 8;
+                int recordEnd = pos + 8 + (int)header.RecLen;
+                
+                if (header.RecType == RT_FontEntityAtom && header.RecLen >= 64)
+                {
+                    // FontEntityAtom: 64 bytes of WCHAR font face name (null-padded)
+                    string fontName = Encoding.Unicode.GetString(data, atomStart, 64).TrimEnd('\0');
+                    _fontTable.Add(fontName);
+                }
+                else if (header.IsContainer)
+                {
+                    ParseFontCollection(data, pos + 8, (int)header.RecLen);
+                }
+                
+                pos = recordEnd;
+                if (pos <= start) break;
+            }
+            
+            if (_fontTable.Count > 0)
+            {
+                Console.WriteLine($"Parsed {_fontTable.Count} fonts: {string.Join(", ", _fontTable)}");
+            }
+        }
+
+        private void GlobalScanForHyperlinks(byte[] data)
+        {
+            for (int p = 0; p < data.Length - 8; p += 8)  // Advance by 8 to check every potential record header
+            {
+                ushort recType = BitConverter.ToUInt16(data, p + 2);
+                if (recType == RT_ExHyperlink)
+                {
+                    uint recLen = BitConverter.ToUInt32(data, p + 4);
+                    ParseExHyperlink(data, p + 8, (int)recLen);
+                }
+            }
+        }
+
+        private void ParseExObjList(byte[] data, int start, int length)
+        {
+            int end = Math.Min(start + length, data.Length);
+            int pos = start;
+            
+            while (pos + 8 <= end)
+            {
+                var header = ReadRecordHeader(data, pos);
+                int atomStart = pos + 8;
+                int recordEnd = pos + 8 + (int)header.RecLen;
+                
+                if (header.RecType == RT_ExOleEmbed || header.RecType == RT_ExEmbed || header.RecType == RT_ExOleLink)
+                {
+                    // Parse the container to find ExOleObjAtom
+                    ParseExOleEmbedContainer(data, atomStart, (int)header.RecLen);
+                }
+                else if (header.IsContainer)
+                {
+                    ParseExObjList(data, atomStart, (int)header.RecLen);
+                }
+                
+                pos = recordEnd;
+                if (pos <= start) break;
+            }
+        }
+        
+        private void ParseExOleEmbedContainer(byte[] data, int start, int length)
+        {
+            int end = Math.Min(start + length, data.Length);
+            int pos = start;
+            
+            int? exObjId = null;
+            string storageName = null;
+            string progId = null;
+            
+            while (pos + 8 <= end)
+            {
+                var header = ReadRecordHeader(data, pos);
+                int atomStart = pos + 8;
+                int recordEnd = pos + 8 + (int)header.RecLen;
+                
+                if (header.RecType == RT_ExOleObjAtom && header.RecLen >= 24)
+                {
+                    // ExOleObjAtom layout:
+                    // 0: drawAspect(4), 1: (don't care)(4), 2: exObjId(4), 3: subType(4), ...
+                    exObjId = BitConverter.ToInt32(data, atomStart + 8);
+                }
+                else if (header.RecType == RT_ExOleObjStg && header.RecLen >= 4)
+                {
+                    // ExOleObjStg contains a 4-byte index used to construct the storage name
+                    // The storage name pattern is "_" + (10-digit decimal number)
+                    // But the actual mapping often uses a persistence directory reference
+                    int stgIndex = BitConverter.ToInt32(data, atomStart);
+                    // Storage name in OLE compound file — try common patterns
+                    storageName = $"_{stgIndex}";
+                }
+                else if (header.RecType == RT_CString && header.RecInstance == 0x01)
+                {
+                    // Instance 0x10 or 0x01 in ExOleEmbed is the ProgId (e.g., "MSGraph.Chart.8")
+                    progId = ParseCString(data, atomStart, (int)header.RecLen);
+                }
+                else if (header.RecType == RT_CString && header.RecInstance == 0x10)
+                {
+                    progId = ParseCString(data, atomStart, (int)header.RecLen);
+                }
+                
+                pos = recordEnd;
+                if (pos <= start) break;
+            }
+            
+            if (exObjId.HasValue && storageName != null)
+            {
+                _exOleObjMap[exObjId.Value] = storageName;
+                Console.WriteLine($"OLE ExObj mapping: exObjId={exObjId.Value} -> storage='{storageName}' progId='{progId}'");
+            }
+        }
+
+        private void ParseExHyperlink(byte[] data, int start, int length)
+        {
+            int end = Math.Min(start + length, data.Length);
+            int pos = start;
+            int? hyperlinkId = null;
+            string url = null;
+
+            while (pos + 8 <= end)
+            {
+                var header = ReadRecordHeader(data, pos);
+                int atomStart = pos + 8;
+                int recordEnd = pos + 8 + (int)header.RecLen;
+
+                if (header.RecType == RT_ExHyperlinkAtom)
+                {
+                    if (header.RecLen >= 4)
+                    {
+                        hyperlinkId = BitConverter.ToInt32(data, atomStart);
+                    }
+                }
+                else if (header.RecType == RT_CString)
+                {
+                    url = ParseCString(data, atomStart, (int)header.RecLen);
+                }
+
+                pos = recordEnd;
+                if (pos <= start) break;
+            }
+
+            if (hyperlinkId.HasValue && !string.IsNullOrEmpty(url))
+            {
+                _hyperlinkMap[hyperlinkId.Value] = url;
+                Console.WriteLine($"Mapped hyperlink {hyperlinkId.Value} -> {url}");
+            }
+        }
+
+        private string ParseCString(byte[] data, int start, int length)
+        {
+            if (length <= 0) return "";
+            // PPT RT_CString is Unicode
+            return Encoding.Unicode.GetString(data, start, length).TrimEnd('\0');
+        }
+
+        private void ParseInteractiveInfo(byte[] data, int start, int length, Shape shape)
+        {
+            int end = Math.Min(start + length, data.Length);
+            int pos = start;
+
+            while (pos + 8 <= end)
+            {
+                var header = ReadRecordHeader(data, pos);
+                int atomStart = pos + 8;
+                int recordEnd = pos + 8 + (int)header.RecLen;
+
+                if (header.RecType == RT_InteractiveInfoAtom)
+                {
+                    if (header.RecLen >= 8)
+                    {
+                        // Byte 4-7 is hyperlink ID
+                        int hyperlinkId = BitConverter.ToInt32(data, atomStart + 4);
+                        if (_hyperlinkMap.TryGetValue(hyperlinkId, out string url))
+                        {
+                            shape.Hyperlink = url;
+                            Console.WriteLine($"Associated hyperlink {hyperlinkId} ({url}) with shape");
+                        }
+                    }
+                }
+                else if (header.IsContainer)
+                {
+                    ParseInteractiveInfo(data, atomStart, (int)header.RecLen, shape);
+                }
+
+                pos = recordEnd;
+                if (pos <= start) break;
+            }
+        }
+
+        private int ParseInteractiveInfoId(byte[] data, int start, int length)
+        {
+            int end = Math.Min(start + length, data.Length);
+            int pos = start;
+
+            while (pos + 8 <= end)
+            {
+                var header = ReadRecordHeader(data, pos);
+                int atomStart = pos + 8;
+                int recordEnd = pos + 8 + (int)header.RecLen;
+
+                if (header.RecType == RT_InteractiveInfoAtom)
+                {
+                    if (header.RecLen >= 8)
+                    {
+                        return BitConverter.ToInt32(data, atomStart + 4);
+                    }
+                }
+                else if (header.IsContainer)
+                {
+                    int res = ParseInteractiveInfoId(data, atomStart, (int)header.RecLen);
+                    if (res > 0) return res;
+                }
+
+                pos = recordEnd;
+                if (pos <= start) break;
+            }
+            return 0;
+        }
+
+        private void ApplyTextHyperlinks(TextParagraph paragraph, List<(int start, int end, int hyperlinkId)> hyperlinks)
+        {
+            if (hyperlinks.Count == 0 || paragraph.Runs.Count == 0) return;
+
+            int currentPos = 0;
+            foreach (var run in paragraph.Runs)
+            {
+                int runLen = run.Text.Length;
+                int runStart = currentPos;
+                int runEnd = currentPos + runLen;
+
+                // Check if any hyperlink range covers this run
+                // Note: PPT text hyperlinks are at character level. 
+                // We'll apply it to the whole run if the run is within the range.
+                foreach (var (hStart, hEnd, hId) in hyperlinks)
+                {
+                    if (hStart <= runStart && hEnd >= runEnd)
+                    {
+                        if (_hyperlinkMap.TryGetValue(hId, out string url))
+                        {
+                            run.Hyperlink = url;
+                            Console.WriteLine($"[DEBUG] Assigned hyperlink '{url}' to TextRun: '{run.Text}'");
+                            break;
+                        }
+                    }
+                }
+                currentPos += runLen;
+            }
+        }
+
+        private int ParseExObjRefAtom(byte[] data, int start, int length)
+        {
+            int end = Math.Min(start + length, data.Length);
+            int pos = start;
+
+            while (pos + 8 <= end)
+            {
+                var header = ReadRecordHeader(data, pos);
+                int atomStart = pos + 8;
+                int recordEnd = pos + 8 + (int)header.RecLen;
+
+                if (header.RecType == RT_ExObjRefAtom)
+                {
+                    if (header.RecLen >= 4)
+                    {
+                        // The atom contains the exObjId (4 bytes)
+                        return BitConverter.ToInt32(data, atomStart);
+                    }
+                }
+                else if (header.IsContainer)
+                {
+                    int res = ParseExObjRefAtom(data, atomStart, (int)header.RecLen);
+                    if (res > 0) return res;
+                }
+
+                pos = recordEnd;
+                if (pos <= start) break;
+            }
+            return 0;
+        }
+
+        private Chart TryParseChartFromExObjId(int exObjId)
+        {
+            if (_oleFile == null) return null;
+
+            string storageName = null;
+            if (_exOleObjMap.TryGetValue(exObjId, out string name))
+            {
+                storageName = name;
+            }
+            else
+            {
+                // Fallback: there might not be a mapping, but maybe there's only one storage
+                // Or maybe the storage name is just $"_{exObjId}" 
+                var storages = _oleFile.GetStoragesByPrefix("_");
+                if (storages.Count > 0)
+                {
+                    // For now just try the first one if we can't map it properly
+                    // A better approach would be to parse the OEPlaceholderAtom properly.
+                    storageName = storages[0].Name;
+                    Console.WriteLine($"Warning: exObjId {exObjId} not in map, trying fallback storage {storageName}");
+                }
+            }
+
+            if (storageName != null)
+            {
+                // Most MS Graph/Excel charts store data in a "Workbook" stream inside the OLE storage
+                var stream = _oleFile.GetChildStream(storageName, "Workbook");
+                
+                // Sometimes it's called "Graph Data" or just "Book" or "\x01CompObj"
+                if (stream == null)
+                    stream = _oleFile.GetChildStream(storageName, "Book");
+                    
+                if (stream != null)
+                {
+                    using (stream)
+                    {
+                        byte[] biffData = ReadAllBytes(stream);
+                        var parser = new PptChartParser();
+                        try
+                        {
+                            return parser.ParseChart(biffData);
+                        }
+                        catch (Exception ex)
+                        {
+                            Console.WriteLine($"Error parsing chart from {storageName}: {ex.Message}");
+                        }
+                    }
+                }
+                else
+                {
+                    Console.WriteLine($"Warning: No Workbook stream found in OLE storage '{storageName}'. Available streams: {string.Join(", ", _oleFile.GetAllStreamNames())}");
+                }
+            }
+            
+            return null;
+        }
+
+        private void ParseDrawingGroup(byte[] data, int start, int length)
+        {
+            int end = Math.Min(start + length, data.Length);
+            int pos = start;
+            
+            while (pos + 8 <= end)
+            {
+                var header = ReadRecordHeader(data, pos);
+                int recordEnd = pos + 8 + (int)header.RecLen;
+                
+                if (header.RecType == ESCHER_BStoreContainer)
+                {
+                    Console.WriteLine($"Found BStoreContainer at {pos}, len {header.RecLen}");
+                    ParseBStore(data, pos + 8, (int)header.RecLen);
+                }
+                else if (header.IsContainer)
+                {
+                    ParseDrawingGroup(data, pos + 8, (int)header.RecLen);
+                }
+                
+                pos = recordEnd;
+                if (pos <= start) break;
+            }
+        }
+
+        private void ParseBStore(byte[] data, int start, int length)
+        {
+            // Count FBSE entries for inline blips, but primarily scan Pictures stream sequentially
+            int end = Math.Min(start + length, data.Length);
+            int pos = start;
+            int blipIndex = 1;
+            
+            // First, try to extract any inline blips embedded directly in FBSE records
+            while (pos + 8 <= end)
+            {
+                var header = ReadRecordHeader(data, pos);
+                int atomStart = pos + 8;
+                int recordEnd = pos + 8 + (int)header.RecLen;
+                
+                if (header.RecType == 0xF007 && header.RecLen > 36) // FBSE with embedded blip
+                {
+                    int blipOffset = atomStart + 36;
+                    if (blipOffset + 8 <= recordEnd)
+                    {
+                        var blipHeader = ReadRecordHeader(data, blipOffset);
+                        if (blipHeader.RecType >= ESCHER_BlipFirst && blipHeader.RecType <= ESCHER_BlipLast)
+                        {
+                            ExtractBlip(data, blipOffset, (int)blipHeader.RecLen + 8, blipIndex);
+                        }
+                    }
+                    blipIndex++;
+                }
+                else if (header.RecType == 0xF007)
+                {
+                    blipIndex++; // Count the FBSE entry even if no inline blip
+                }
+                
+                pos = recordEnd;
+                if (pos <= start) break;
+            }
+            
+            // Now scan the Pictures stream sequentially — this is the reliable method
+            // The Pictures stream contains blip records back-to-back with no container wrapper
+            if (_picturesData != null && _picturesData.Length > 8)
+            {
+                int picPos = 0;
+                int picBlipIndex = 1;
+                while (picPos + 8 <= _picturesData.Length)
+                {
+                    var picHeader = ReadRecordHeader(_picturesData, picPos);
+                    if (picHeader.RecType >= ESCHER_BlipFirst && picHeader.RecType <= ESCHER_BlipLast 
+                        && picHeader.RecLen > 0 && picHeader.RecLen < (uint)(_picturesData.Length - picPos))
+                    {
+                        if (!_blipMap.ContainsKey(picBlipIndex)) // Don't overwrite inline blips
+                        {
+                            ExtractBlip(_picturesData, picPos, (int)picHeader.RecLen + 8, picBlipIndex);
+                        }
+                        picBlipIndex++;
+                        picPos += 8 + (int)picHeader.RecLen;
+                    }
+                    else
+                    {
+                        // Skip unknown data — try next byte alignment (shouldn't happen in well-formed streams)
+                        picPos++;
+                    }
+                }
+                Console.WriteLine($"Pictures stream scan: found {_blipMap.Count} blips");
+            }
+        }
+
+        private void ExtractBlip(byte[] data, int start, int length, int id)
+        {
+            var header = ReadRecordHeader(data, start);
+            int dataOffset = start + 8;
+            
+            byte[] imgData = null;
+            string ext = "png";
+            string contentType = "image/png";
+            
+            // Blip RecType values:
+            //   0xF01A = EMF, 0xF01B = WMF, 0xF01C = PICT
+            //   0xF01D = JPEG (instance 0x46A), 0xF01E = PNG (instance 0x6E0)
+            //   0xF01F = DIB, 0xF029 = TIFF
+            //   0xF01D also used for JPEG with instance 0x46B (secondary UID)
+            //   0xF01E also used for PNG with instance 0x6E1 (secondary UID)
+            
+            if (header.RecType >= 0xF018 && header.RecType <= 0xF117)
+            {
+                bool isMetafile = (header.RecType >= 0xF01A && header.RecType <= 0xF01C);
+                
+                // Detect secondary UID: for JPEG/PNG/DIB, instance odd = has secondary UID
+                // For metafiles (EMF/WMF/PICT), instance odd = has secondary UID  
+                bool hasSecondaryUid = (header.RecInstance & 1) == 1;
+                
+                int headerSize;
+                if (isMetafile)
+                {
+                    // Metafile blips: rgbUid(16) [+ rgbUid2(16)] + cbSave(4) + rcBounds(8) + ptSize(8) + cbSave(4) + compression(1) + filter(1)
+                    // = 16 + 4 + 8 + 8 + 4 + 1 + 1 = 42 bytes, or 58 with secondary UID
+                    // Simpler: the fixed header part after UID is 26 bytes
+                    headerSize = hasSecondaryUid ? (16 + 16 + 26) : (16 + 26);
+                }
+                else
+                {
+                    // Bitmap blips (JPEG/PNG/DIB/TIFF): rgbUid(16) [+ rgbUid2(16)] + marker(1)
+                    headerSize = hasSecondaryUid ? (16 + 16 + 1) : (16 + 1);
+                }
+                
+                switch (header.RecType)
+                {
+                    case 0xF01A: // EMF
+                        ext = "emf";
+                        contentType = "image/x-emf";
+                        break;
+                    case 0xF01B: // WMF
+                        ext = "wmf";
+                        contentType = "image/x-wmf";
+                        break;
+                    case 0xF01C: // PICT
+                        ext = "pict";
+                        contentType = "image/x-pict";
+                        break;
+                    case 0xF01D: // JPEG
+                        ext = "jpg";
+                        contentType = "image/jpeg";
+                        break;
+                    case 0xF01E: // PNG
+                        ext = "png";
+                        contentType = "image/png";
+                        break;
+                    case 0xF01F: // DIB
+                        ext = "bmp";
+                        contentType = "image/bmp";
+                        break;
+                    case 0xF029: // TIFF
+                        ext = "tiff";
+                        contentType = "image/tiff";
+                        break;
+                    default:
+                        break;
+                }
+                
+                int imgLen = (int)header.RecLen - headerSize;
+                if (imgLen > 0 && dataOffset + headerSize + imgLen <= data.Length)
+                {
+                    imgData = new byte[imgLen];
+                    Array.Copy(data, dataOffset + headerSize, imgData, 0, imgLen);
+                    
+                    // Metafile blips may be zlib-compressed; check compression byte
+                    if (isMetafile && headerSize >= 42)
+                    {
+                        int compressionOffset = dataOffset + headerSize - 2; // compression byte is 2nd-to-last in header
+                        if (compressionOffset >= 0 && compressionOffset < data.Length)
+                        {
+                            byte compression = data[compressionOffset];
+                            if (compression == 0x00) // 0 = deflate compressed
+                            {
+                                try
+                                {
+                                    // Read uncompressed size from cbSave-preceding field (cbSize at offset UID+4)
+                                    using var compStream = new System.IO.MemoryStream(imgData);
+                                    using var deflate = new System.IO.Compression.DeflateStream(compStream, System.IO.Compression.CompressionMode.Decompress);
+                                    using var outStream = new System.IO.MemoryStream();
+                                    deflate.CopyTo(outStream);
+                                    imgData = outStream.ToArray();
+                                }
+                                catch
+                                {
+                                    // If decompression fails, keep original data
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            
+            if (imgData != null && imgData.Length > 0)
+            {
+                _blipMap[id] = new ImageResource { Id = id, Data = imgData, Extension = ext, ContentType = contentType };
+            }
+        }
+
+        private void ParseSlideListWithText(byte[] data, int start, int length, Presentation presentation, Dictionary<int, int> persistMap, List<int> slidePersistIds)
+        {
+            int end = Math.Min(start + length, data.Length);
+            int pos = start;
+            
+            Slide currentSlide = null;
+            string lastText = null;
+            List<(int start, int end, int hyperlinkId)> pendingHyperlinks = new List<(int, int, int)>();
+            int? lastTextRangeStart = null;
+            int? lastTextRangeEnd = null;
+            
+            while (pos + 8 <= end)
+            {
+                var header = ReadRecordHeader(data, pos);
+                int atomStart = pos + 8;
+                int recordEnd = pos + 8 + (int)header.RecLen;
+                
+                switch (header.RecType)
+                {
+                    case RT_SlidePersistAtom:
+                        if (header.RecLen >= 20)
+                        {
+                            int persistRef = BitConverter.ToInt32(data, atomStart);
+                            int slideId = BitConverter.ToInt32(data, atomStart + 8);
+                            slidePersistIds.Add(persistRef);
+                            
+                            currentSlide = new Slide { Index = presentation.Slides.Count + 1 };
+                            presentation.Slides.Add(currentSlide);
+                            
+                            if (persistMap.TryGetValue(persistRef, out int slideOffset))
+                            {
+                                if (slideOffset >= 0 && slideOffset < data.Length - 8)
+                                {
+                                    var slideHeader = ReadRecordHeader(data, slideOffset);
+                                    if (slideHeader.RecType == RT_Slide)
+                                    {
+                                        ParseSlideContainer(data, slideOffset + 8, (int)slideHeader.RecLen, currentSlide);
+                                    }
+                                }
+                            }
+                        }
+                        break;
+                        
+                    case RT_TextCharsAtom:
+                        lastText = ReadUnicodeString(data, atomStart, (int)header.RecLen);
+                        if (currentSlide != null && !string.IsNullOrWhiteSpace(lastText))
+                        {
+                            var paragraph = new TextParagraph();
+                            paragraph.Runs.Add(new TextRun { Text = lastText });
+                            currentSlide.TextContent.Add(paragraph);
+                        }
+                        break;
+                        
+                    case RT_TextBytesAtom:
+                        lastText = ReadAnsiString(data, atomStart, (int)header.RecLen);
+                        if (currentSlide != null && !string.IsNullOrWhiteSpace(lastText))
+                        {
+                            var paragraph = new TextParagraph();
+                            paragraph.Runs.Add(new TextRun { Text = lastText });
+                            currentSlide.TextContent.Add(paragraph);
+                        }
+                        break;
+
+                    case RT_StyleTextPropAtom:
+                        if (currentSlide != null && currentSlide.TextContent.Count > 0 && !string.IsNullOrEmpty(lastText))
+                        {
+                            var lastPara = currentSlide.TextContent.Last();
+                            ParseStyleTextPropAtom(data, atomStart, (int)header.RecLen, lastPara, lastText.Length);
+                            ApplyTextHyperlinks(lastPara, pendingHyperlinks);
+                            pendingHyperlinks.Clear();
+                        }
+                        break;
+
+                    case RT_TextInteractiveInfoAtom:
+                        if (header.RecLen >= 8)
+                        {
+                            lastTextRangeStart = BitConverter.ToInt32(data, atomStart);
+                            lastTextRangeEnd = BitConverter.ToInt32(data, atomStart + 4);
+                        }
+                        break;
+
+                    case RT_InteractiveInfo:
+                        if (lastTextRangeStart.HasValue && lastTextRangeEnd.HasValue)
+                        {
+                            // In text sequence, InteractiveInfo container usually follows TextInteractiveInfoAtom
+                            // We need to look inside it for InteractiveInfoAtom
+                            int iiId = ParseInteractiveInfoId(data, atomStart, (int)header.RecLen);
+                            if (iiId > 0)
+                            {
+                                pendingHyperlinks.Add((lastTextRangeStart.Value, lastTextRangeEnd.Value, iiId));
+                            }
+                            lastTextRangeStart = null;
+                            lastTextRangeEnd = null;
+                        }
+                        break;
+                }
+                
+                pos = recordEnd;
+                if (pos <= start) break;
+            }
+        }
+
+        private void ParseStyleTextPropAtom(byte[] data, int start, int length, TextParagraph paragraph, int textLength)
+        {
+            int end = Math.Min(start + length, data.Length);
+            int pos = start;
+            string fullText = paragraph.GetPlainText();
+            int textCharCount = textLength + 1; // +1 for the CR at the end in PPT text runs
+
+            // === Phase 1: Parse paragraph-level runs ===
+            var paraStyles = new List<(int count, TextAlignment align)>();
+            int paraTextConsumed = 0;
+            while (pos < end && paraTextConsumed < textCharCount)
+            {
+                if (pos + 4 > end) break;
+                int paraRunChars = (int)BitConverter.ToUInt32(data, pos);
+                pos += 4;
+                paraTextConsumed += paraRunChars;
+
+                if (pos + 2 > end) break;
+                ushort paraIndentLevel = BitConverter.ToUInt16(data, pos);
+                pos += 2;
+
+                if (pos + 4 > end) break;
+                uint paraMask = BitConverter.ToUInt32(data, pos);
+                pos += 4;
+
+                TextAlignment align = TextAlignment.Left;
+
+                // Parse paragraph properties based on mask bits
+                if ((paraMask & 0x000F) != 0) // bulletFlags
+                    pos = Math.Min(pos + 2, end);
+                if ((paraMask & 0x0080) != 0) // bulletChar
+                    pos = Math.Min(pos + 2, end);
+                if ((paraMask & 0x0010) != 0) // bulletFontRef
+                    pos = Math.Min(pos + 2, end);
+                if ((paraMask & 0x0040) != 0) // bulletSize
+                    pos = Math.Min(pos + 2, end);
+                if ((paraMask & 0x0020) != 0) // bulletColor
+                    pos = Math.Min(pos + 4, end);
+                if ((paraMask & 0x0800) != 0) // textAlignment
+                {
+                    if (pos + 2 <= end)
+                    {
+                        ushort alignVal = BitConverter.ToUInt16(data, pos);
+                        align = alignVal switch { 1 => TextAlignment.Center, 2 => TextAlignment.Right, 3 => TextAlignment.Justify, _ => TextAlignment.Left };
+                    }
+                    pos = Math.Min(pos + 2, end);
+                }
+                if ((paraMask & 0x1000) != 0) // lineSpacing
+                    pos = Math.Min(pos + 2, end);
+                if ((paraMask & 0x2000) != 0) // spaceBefore
+                    pos = Math.Min(pos + 2, end);
+                if ((paraMask & 0x4000) != 0) // spaceAfter
+                    pos = Math.Min(pos + 2, end);
+                if ((paraMask & 0x8000) != 0) // leftMargin
+                    pos = Math.Min(pos + 2, end);
+                if ((paraMask & 0x10000) != 0) // indent
+                    pos = Math.Min(pos + 2, end);
+                if ((paraMask & 0x0100) != 0) // defaultTabSize
+                    pos = Math.Min(pos + 2, end);
+                if ((paraMask & 0x0400) != 0) // wrapFlags
+                    pos = Math.Min(pos + 2, end);
+                if ((paraMask & 0x200000) != 0) // fontAlign
+                    pos = Math.Min(pos + 2, end);
+                // textDirection, reserved, etc. — skip any other known bits
+
+                paraStyles.Add((paraRunChars, align));
+            }
+
+            // Apply first paragraph alignment
+            if (paraStyles.Count > 0)
+            {
+                paragraph.Alignment = paraStyles[0].align;
+            }
+
+            // === Phase 2: Parse character-level runs ===
+            var runs = new List<TextRun>();
+            int charTextConsumed = 0;
+            int textPos = 0;
+            while (pos < end && charTextConsumed < textCharCount)
+            {
+                if (pos + 4 > end) break;
+                int charRunChars = (int)BitConverter.ToUInt32(data, pos);
+                pos += 4;
+                charTextConsumed += charRunChars;
+
+                if (pos + 4 > end) break;
+                uint charMask = BitConverter.ToUInt32(data, pos);
+                pos += 4;
+
+                var run = new TextRun();
+
+                // Parse character properties based on mask bits
+                if ((charMask & 0xFFFF) != 0) // charFlags (bold, italic, underline, etc.)
+                {
+                    if (pos + 2 <= end)
+                    {
+                        ushort flags = BitConverter.ToUInt16(data, pos);
+                        run.Bold = (flags & 0x01) != 0;
+                        run.Italic = (flags & 0x02) != 0;
+                        run.Underline = (flags & 0x04) != 0;
+                    }
+                    pos = Math.Min(pos + 2, end);
+                }
+                if ((charMask & 0x10000) != 0) // fontRef
+                {
+                    if (pos + 2 <= end)
+                    {
+                        int fontIdx = BitConverter.ToUInt16(data, pos);
+                        if (fontIdx >= 0 && fontIdx < _fontTable.Count)
+                        {
+                            run.FontName = _fontTable[fontIdx];
+                        }
+                    }
+                    pos = Math.Min(pos + 2, end);
+                }
+                if ((charMask & 0x200000) != 0) // oldEAFontRef
+                    pos = Math.Min(pos + 2, end);
+                if ((charMask & 0x400000) != 0) // ansiFontRef
+                    pos = Math.Min(pos + 2, end);
+                if ((charMask & 0x800000) != 0) // symbolFontRef
+                    pos = Math.Min(pos + 2, end);
+                if ((charMask & 0x20000) != 0) // fontSize
+                {
+                    if (pos + 2 <= end)
+                    {
+                        // PPT stores font size in points * 100 (hundredths of a point)  
+                        // OOXML uses hundredths of a point as well
+                        run.FontSize = BitConverter.ToUInt16(data, pos) * 100;
+                    }
+                    pos = Math.Min(pos + 2, end);
+                }
+                if ((charMask & 0x40000) != 0) // color
+                {
+                    if (pos + 4 <= end)
+                    {
+                        byte b = data[pos];
+                        byte g = data[pos + 1];
+                        byte r = data[pos + 2];
+                        run.Color = $"{r:X2}{g:X2}{b:X2}";
+                    }
+                    pos = Math.Min(pos + 4, end);
+                }
+                if ((charMask & 0x80000) != 0) // position (superscript/subscript)
+                    pos = Math.Min(pos + 2, end);
+
+                // Assign text for this run
+                int runTextLen = Math.Min(charRunChars, fullText.Length - textPos);
+                if (runTextLen > 0)
+                {
+                    run.Text = fullText.Substring(textPos, runTextLen);
+                    textPos += runTextLen;
+                    runs.Add(run);
+                }
+            }
+
+            if (runs.Count > 0)
+            {
+                paragraph.Runs = runs;
+            }
+        }
+
+        private Shape ParseSpContainer(byte[] data, int start, int length)
+        {
+            int end = Math.Min(start + length, data.Length);
+            int pos = start;
+            
+            var shape = new Shape { Type = "Rectangle" };
+            
+            while (pos + 8 <= end)
+            {
+                var header = ReadRecordHeader(data, pos);
+                int atomStart = pos + 8;
+                int recordEnd = pos + 8 + (int)header.RecLen;
+                
+                switch (header.RecType)
+                {
+                    case ESCHER_ChildAnchor:
+                        if (header.RecLen >= 16)
+                        {
+                            int left = BitConverter.ToInt32(data, atomStart);
+                            int top = BitConverter.ToInt32(data, atomStart + 4);
+                            int right = BitConverter.ToInt32(data, atomStart + 8);
+                            int bottom = BitConverter.ToInt32(data, atomStart + 12);
+                            
+                            // ChildAnchors are relative to the parent group.
+                            // In PPT, flat shapes use master coordinates (where 1 unit = 1/8 point = 1587.5 EMUs)
+                            // We do a rough conversion here assuming no scaling group.
+                            shape.Left = (long)(left * 12700) / 8;
+                            shape.Top = (long)(top * 12700) / 8;
+                            shape.Width = (long)((right - left) * 12700) / 8;
+                            shape.Height = (long)((bottom - top) * 12700) / 8;
+                        }
+                        break;
+                        
+                    case ESCHER_ClientAnchor:
+                        if (header.RecLen == 8)
+                        {
+                            // PowerPoint specific ClientAnchor is 8 bytes (Top, Left, Right, Bottom as Int16 in 1/8 points)
+                            short top = BitConverter.ToInt16(data, atomStart);
+                            short left = BitConverter.ToInt16(data, atomStart + 2);
+                            short right = BitConverter.ToInt16(data, atomStart + 4);
+                            short bottom = BitConverter.ToInt16(data, atomStart + 6);
+                            
+                            shape.Left = (long)(left * 12700) / 8;
+                            shape.Top = (long)(top * 12700) / 8;
+                            shape.Width = (long)((right - left) * 12700) / 8;
+                            shape.Height = (long)((bottom - top) * 12700) / 8;
+                        }
+                        else if (header.RecLen >= 16)
+                        {
+                            int top = BitConverter.ToInt32(data, atomStart);
+                            int left = BitConverter.ToInt32(data, atomStart + 4);
+                            int right = BitConverter.ToInt32(data, atomStart + 8);
+                            int bottom = BitConverter.ToInt32(data, atomStart + 12);
+                            
+                            shape.Left = (long)(left * 12700) / 8;
+                            shape.Top = (long)(top * 12700) / 8;
+                            shape.Width = (long)((right - left) * 12700) / 8;
+                            shape.Height = (long)((bottom - top) * 12700) / 8;
+                        }
+                        break;
+                        
+                    case ESCHER_ClientTextbox:
+                        shape.Type = "TextBox";
+                        ParseClientTextbox(data, atomStart, (int)header.RecLen, shape);
+                        break;
+                        
+                    case ESCHER_Sp:
+                        if (header.RecLen >= 8)
+                        {
+                            uint flags = BitConverter.ToUInt32(data, atomStart + 4);
+                            if ((flags & 0x01) != 0) shape.Type = "Group";
+                        }
+                        break;
+
+                    case ESCHER_Opt:
+                        // Find blip id if this is a picture
+                        ParseEscherOpt(data, atomStart, (int)header.RecLen, shape);
+                        break;
+                        
+                    case ESCHER_ClientData:
+                        ParseInteractiveInfo(data, atomStart, (int)header.RecLen, shape);
+                        // Check for OLE object reference (chart detection)
+                        int exObjId = ParseExObjRefAtom(data, atomStart, (int)header.RecLen);
+                        if (exObjId > 0)
+                        {
+                            var chart = TryParseChartFromExObjId(exObjId);
+                            if (chart != null)
+                            {
+                                shape.Type = "Chart";
+                                shape.Chart = chart;
+                                Console.WriteLine($"Parsed chart from exObjId={exObjId}: {chart.Series.Count} series");
+                            }
+                        }
+                        break;
+                }
+                
+                pos = recordEnd;
+                if (pos <= start) break;
+            }
+            
+            if (shape.Type == "Group" && string.IsNullOrEmpty(shape.Text) && shape.Paragraphs.Count == 0 && shape.ImageId == null)
+                return null;
+                
+            return shape;
+        }
+
+        private void ParseSlideContainer(byte[] data, int start, int length, Slide slide)
+        {
+            int end = Math.Min(start + length, data.Length);
+            int pos = start;
+            
+            while (pos + 8 <= end)
+            {
+                var header = ReadRecordHeader(data, pos);
+                int recordEnd = pos + 8 + (int)header.RecLen;
+                
+                if (header.RecType == RT_SlideAtom)
+                {
+                    // Basic slide info
+                }
+                else if (header.RecType == ESCHER_DgContainer)
+                {
+                    ParseDrawingContainer(data, pos + 8, (int)header.RecLen, slide);
+                }
+                else if (header.IsContainer)
+                {
+                    ParseSlideContainer(data, pos + 8, (int)header.RecLen, slide);
+                }
+                
+                pos = recordEnd;
+                if (pos <= start) break;
+            }
+        }
+
+        private void ParseDrawingContainer(byte[] data, int start, int length, Slide slide)
+        {
+            int end = Math.Min(start + length, data.Length);
+            int pos = start;
+            
+            while (pos + 8 <= end)
+            {
+                var header = ReadRecordHeader(data, pos);
+                int recordEnd = pos + 8 + (int)header.RecLen;
+                
+                if (header.RecType == ESCHER_SpContainer)
+                {
+                    var shape = ParseSpContainer(data, pos + 8, (int)header.RecLen);
+                    if (shape != null)
+                    {
+                        slide.Shapes.Add(shape);
+                        if (!string.IsNullOrEmpty(shape.Text))
+                        {
+                            var para = new TextParagraph();
+                            para.Runs.Add(new TextRun { Text = shape.Text });
+                            slide.TextContent.Add(para);
+                        }
+                    }
+                }
+                else if (header.IsContainer)
+                {
+                    ParseDrawingContainer(data, pos + 8, (int)header.RecLen, slide);
+                }
+                
+                pos = recordEnd;
+                if (pos <= start) break;
+            }
+        }
+
+        private void ParseEscherOpt(byte[] data, int start, int length, Shape shape)
+        {
+            int end = Math.Min(start + length, data.Length);
+            int pos = start;
+            
+            while (pos + 6 <= end)
+            {
+                ushort propId = BitConverter.ToUInt16(data, pos);
+                uint propValue = BitConverter.ToUInt32(data, pos + 2);
+                pos += 6;
+                
+                int pid = propId & 0x3FFF;
+                bool isComplex = (propId & 0x8000) != 0;
+                
+                switch (pid)
+                {
+                    case 0x0104: // pib (Picture Blip ID)
+                        shape.ImageId = (int)propValue;
+                        shape.Type = "Picture";
+                        break;
+                    case 0x0181: // fillColor
+                        // BGR format in Escher
+                        byte fb = (byte)(propValue & 0xFF);
+                        byte fg = (byte)((propValue >> 8) & 0xFF);
+                        byte fr = (byte)((propValue >> 16) & 0xFF);
+                        shape.FillColor = $"{fr:X2}{fg:X2}{fb:X2}";
+                        break;
+                    case 0x01BF: // fNoFillHitTest (fill style bool props)
+                        // Bit 4 (0x10): fFilled
+                        if ((propValue & 0x10) == 0)
+                            shape.FillColor = null; // no fill
+                        break;
+                    case 0x01C0: // lineColor
+                        byte lb = (byte)(propValue & 0xFF);
+                        byte lg = (byte)((propValue >> 8) & 0xFF);
+                        byte lr = (byte)((propValue >> 16) & 0xFF);
+                        shape.LineColor = $"{lr:X2}{lg:X2}{lb:X2}";
+                        break;
+                    case 0x01C3: // fNoLine (line style bool props)
+                        // Bit 3 (0x08): fLine
+                        if ((propValue & 0x08) == 0)
+                            shape.LineColor = null;
+                        break;
+                }
+            }
+        }
+        
+        private void ParseClientTextbox(byte[] data, int start, int length, Shape shape)
+        {
+            int end = Math.Min(start + length, data.Length);
+            int pos = start;
+            
+            while (pos + 8 <= end)
+            {
+                var header = ReadRecordHeader(data, pos);
+                int atomStart = pos + 8;
+                int recordEnd = pos + 8 + (int)header.RecLen;
+                
+                if (header.RecType == RT_TextCharsAtom)
+                {
+                    string text = ReadUnicodeString(data, atomStart, (int)header.RecLen);
+                    if (!string.IsNullOrEmpty(text))
+                    {
+                        shape.Text = (shape.Text ?? "") + text;
+                        var paragraph = new TextParagraph();
+                        paragraph.Runs.Add(new TextRun { Text = text });
+                        shape.Paragraphs.Add(paragraph);
+                    }
+                }
+                else if (header.RecType == RT_TextBytesAtom)
+                {
+                    string text = ReadAnsiString(data, atomStart, (int)header.RecLen);
+                    if (!string.IsNullOrEmpty(text))
+                    {
+                        shape.Text = (shape.Text ?? "") + text;
+                        var paragraph = new TextParagraph();
+                        paragraph.Runs.Add(new TextRun { Text = text });
+                        shape.Paragraphs.Add(paragraph);
+                    }
+                }
+                
+                pos = recordEnd;
+                if (pos <= start) break;
+            }
+        }
+        
+        /// <summary>
+        /// 直接扫描整个 PPT 流提取所有文本（备用方案）
+        /// </summary>
+        private void DirectScanForSlides(byte[] data, Presentation presentation)
+        {
+            // 第一遍: 找到所有的 SlideContainer
+            var slideOffsets = new List<int>();
+            int pos = 0;
+            
+            while (pos + 8 <= data.Length)
+            {
+                var header = ReadRecordHeader(data, pos);
+                
+                if (header.RecType == RT_Slide && header.IsContainer)
+                {
+                    slideOffsets.Add(pos);
+                    pos += 8 + (int)header.RecLen;
+                }
+                else if (header.IsContainer)
+                {
+                    pos += 8; // 进入容器继续扫描
+                }
+                else if (header.RecLen > 0 && header.RecLen < data.Length)
+                {
+                    pos += 8 + (int)header.RecLen;
+                }
+                else
+                {
+                    pos += 8;
+                }
+                
+                if (pos <= 0) break;
+            }
+            
+            // 解析每个 SlideContainer
+            foreach (int offset in slideOffsets)
+            {
+                var header = ReadRecordHeader(data, offset);
+                var slide = new Slide { Index = presentation.Slides.Count + 1 };
+                ParseSlideContainer(data, offset + 8, (int)header.RecLen, slide);
+                presentation.Slides.Add(slide);
+            }
+            
+            // 如果还是没有找到，做最后的文本扫描
+            if (presentation.Slides.Count == 0)
+            {
+                var defaultSlide = new Slide { Index = 1 };
+                ScanAllText(data, defaultSlide);
+                if (defaultSlide.TextContent.Count > 0 || defaultSlide.Shapes.Count > 0)
+                {
+                    presentation.Slides.Add(defaultSlide);
+                }
+            }
+        }
+        
+        /// <summary>
+        /// 扫描整个 PPT 流中的所有文本记录
+        /// </summary>
+        private void ScanAllText(byte[] data, Slide slide)
+        {
+            int pos = 0;
+            while (pos + 8 <= data.Length)
+            {
+                var header = ReadRecordHeader(data, pos);
+                int atomStart = pos + 8;
+                
+                if (header.RecType == RT_TextCharsAtom && !header.IsContainer && header.RecLen > 0 && header.RecLen < 100000)
+                {
+                    if (atomStart + header.RecLen <= data.Length)
+                    {
+                        string text = ReadUnicodeString(data, atomStart, (int)header.RecLen);
+                        if (!string.IsNullOrWhiteSpace(text))
+                        {
+                            var paragraph = new TextParagraph();
+                            paragraph.Runs.Add(new TextRun { Text = text });
+                            slide.TextContent.Add(paragraph);
+                            
+                            var shape = new Shape { Type = "TextBox", Text = text };
+                            shape.Left = 457200;  // 0.5 inch
+                            shape.Top = (long)(457200 + slide.Shapes.Count * 914400);  // stack vertically
+                            shape.Width = 8229600;  // 9 inches
+                            shape.Height = 457200;  // 0.5 inch
+                            shape.Paragraphs.Add(paragraph);
+                            slide.Shapes.Add(shape);
+                        }
+                    }
+                }
+                else if (header.RecType == RT_TextBytesAtom && !header.IsContainer && header.RecLen > 0 && header.RecLen < 100000)
+                {
+                    if (atomStart + header.RecLen <= data.Length)
+                    {
+                        string text = ReadAnsiString(data, atomStart, (int)header.RecLen);
+                        if (!string.IsNullOrWhiteSpace(text))
+                        {
+                            var paragraph = new TextParagraph();
+                            paragraph.Runs.Add(new TextRun { Text = text });
+                            slide.TextContent.Add(paragraph);
+                            
+                            var shape = new Shape { Type = "TextBox", Text = text };
+                            shape.Left = 457200;
+                            shape.Top = (long)(457200 + slide.Shapes.Count * 914400);
+                            shape.Width = 8229600;
+                            shape.Height = 457200;
+                            shape.Paragraphs.Add(paragraph);
+                            slide.Shapes.Add(shape);
+                        }
+                    }
+                }
+                
+                // 移到下一个记录
+                if (header.RecLen > 0 && header.RecLen < data.Length && !header.IsContainer)
+                {
+                    pos = atomStart + (int)header.RecLen;
+                }
+                else if (header.IsContainer)
+                {
+                    pos += 8; // 进入容器内部
+                }
+                else
+                {
+                    pos += 8;
+                }
+                
+                if (pos <= 0) break;
+            }
+        }
+        
+        #region PPT Record Header
+        
+        private struct RecordHeader
+        {
+            public int RecVer;
+            public int RecInstance;
+            public ushort RecType;
+            public uint RecLen;
+            
+            public bool IsContainer => RecVer == 0x0F;
+        }
+        
+        private RecordHeader ReadRecordHeader(byte[] data, int offset)
+        {
+            if (offset + 8 > data.Length)
+                return new RecordHeader { RecType = 0, RecLen = 0 };
+                
+            ushort verInst = BitConverter.ToUInt16(data, offset);
+            return new RecordHeader
+            {
+                RecVer = verInst & 0x0F,
+                RecInstance = (verInst >> 4) & 0x0FFF,
+                RecType = BitConverter.ToUInt16(data, offset + 2),
+                RecLen = BitConverter.ToUInt32(data, offset + 4)
+            };
+        }
+        
+        private int ScanForRecord(byte[] data, ushort recordType)
+        {
+            int pos = 0;
+            while (pos + 8 <= data.Length)
+            {
+                var header = ReadRecordHeader(data, pos);
+                if (header.RecType == recordType)
+                    return pos;
+                    
+                if (header.IsContainer)
+                {
+                    pos += 8; // 进入容器
+                }
+                else if (header.RecLen > 0 && pos + 8 + header.RecLen <= data.Length)
+                {
+                    pos += 8 + (int)header.RecLen;
+                }
+                else
+                {
+                    pos += 8;
+                }
+            }
+            return -1;
+        }
+        
+        #endregion
+        
+        #region Helpers
+        
+        private string ReadUnicodeString(byte[] data, int offset, int byteCount)
+        {
+            if (offset + byteCount > data.Length)
+                byteCount = data.Length - offset;
+            if (byteCount <= 0) return "";
+            
+            try
+            {
+                return Encoding.Unicode.GetString(data, offset, byteCount).TrimEnd('\0');
+            }
+            catch
+            {
+                return "";
+            }
+        }
+        
+        private string ReadAnsiString(byte[] data, int offset, int byteCount)
+        {
+            if (offset + byteCount > data.Length)
+                byteCount = data.Length - offset;
+            if (byteCount <= 0) return "";
+            
+            try
+            {
+                // PPT stores ANSI text using the system code page
+                // For Chinese systems this is GB2312/GBK (codepage 936)
+                var encoding = Encoding.GetEncoding(936);
+                return encoding.GetString(data, offset, byteCount).TrimEnd('\0');
+            }
+            catch
+            {
+                // Fallback to Latin1 if GB2312 fails
+                try { return Encoding.Latin1.GetString(data, offset, byteCount).TrimEnd('\0'); }
+                catch { return ""; }
+            }
+        }
+        
+        private static string TruncateText(string text, int maxLen)
+        {
+            if (text == null) return "";
+            text = text.Replace("\r", "\\r").Replace("\n", "\\n");
+            return text.Length > maxLen ? text.Substring(0, maxLen) + "..." : text;
+        }
+        
+        private static byte[] ReadAllBytes(Stream stream)
+        {
+            if (stream is MemoryStream ms)
+            {
+                return ms.ToArray();
+            }
+            
+            using var result = new MemoryStream();
+            stream.CopyTo(result);
+            return result.ToArray();
+        }
+        
+        #endregion
+        
+        private VbaProject ReadVbaProject(OleCompoundFile oleFile)
+        {
+            var vbaStream = oleFile.GetStream("VBA Project");
+            if (vbaStream != null)
+            {
+                using (vbaStream)
+                {
+                    var vbaProject = new VbaProject();
+                    vbaProject.ProjectData = ReadAllBytes(vbaStream);
+                    return vbaProject;
+                }
+            }
+            return null;
+        }
+        
+        public void Dispose()
+        {
+            _stream.Dispose();
+        }
+    }
+}
