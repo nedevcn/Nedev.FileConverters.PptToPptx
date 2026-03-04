@@ -17,8 +17,10 @@ namespace Nefdev.PptToPptx
     public class Slide
     {
         public int Index { get; set; }
+        public int SlideId { get; set; }
         public List<Shape> Shapes { get; set; }
         public List<TextParagraph> TextContent { get; set; }
+        public string Notes { get; set; }
         
         public Slide()
         {
@@ -42,6 +44,9 @@ namespace Nefdev.PptToPptx
         // 文本内容 (富文本)
         public List<TextParagraph> Paragraphs { get; set; }
         
+        // Table content
+        public Table Table { get; set; }
+
         // 图片引用
         public int? ImageId { get; set; }
         public byte[] ImageData { get; set; }
@@ -161,5 +166,24 @@ namespace Nefdev.PptToPptx
     {
         public string Name { get; set; }
         public string Code { get; set; }
+    }
+
+    public class Table
+    {
+        public List<TableRow> Rows { get; set; }
+        public Table() { Rows = new List<TableRow>(); }
+    }
+
+    public class TableRow
+    {
+        public List<TableCell> Cells { get; set; }
+        public TableRow() { Cells = new List<TableCell>(); }
+    }
+
+    public class TableCell
+    {
+        public List<TextParagraph> TextContent { get; set; }
+        public string FillColor { get; set; }
+        public TableCell() { TextContent = new List<TextParagraph>(); }
     }
 }

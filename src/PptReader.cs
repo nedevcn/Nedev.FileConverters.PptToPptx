@@ -29,6 +29,8 @@ namespace Nefdev.PptToPptx
         private const ushort RT_PersistDirectoryAtom = 6002;  // 0x1772
         private const ushort RT_CurrentUserAtom = 4086;
         private const ushort RT_SlideAtom = 1007;
+        private const ushort RT_Notes = 1008;
+        private const ushort RT_NotesAtom = 1009;
         private const ushort RT_DocumentAtom = 1001;
         private const ushort RT_Environment = 1010;
         private const ushort RT_FontCollection = 2005;
@@ -70,6 +72,7 @@ namespace Nefdev.PptToPptx
         private Dictionary<int, ImageResource> _blipMap = new Dictionary<int, ImageResource>();
         private List<string> _fontTable = new List<string>();
         private Dictionary<int, string> _hyperlinkMap = new Dictionary<int, string>();
+        private Dictionary<int, string> _notesIdMap = new Dictionary<int, string>(); // slideIdRef -> notes text
 
         public PptReader(string path)
         {
@@ -130,6 +133,15 @@ namespace Nefdev.PptToPptx
                     // 解析 Document 和 Slides
                     ParsePptData(pptData, presentation, persistDirectory);
                     
+                    // 关联 Notes 到 Slide
+                    foreach (var slide in presentation.Slides)
+                    {
+                        if (_notesIdMap.TryGetValue(slide.SlideId, out string notesText))
+                        {
+                            slide.Notes = notesText;
+                        }
+                    }
+
                     // 将 blipMap 中的图片添加到 Presentation
                     presentation.Images.AddRange(_blipMap.Values);
                 }
@@ -240,6 +252,20 @@ namespace Nefdev.PptToPptx
                 {
                     var header = ReadRecordHeader(data, offset);
                     ParseDocumentContainer(data, offset + 8, (int)header.RecLen, presentation, persistMap);
+                }
+            }
+
+            // Also scan for Notes containers (RT_Notes = 1008) in the persist directory
+            foreach (var kvp in persistMap)
+            {
+                int offset = kvp.Value;
+                if (offset >= 0 && offset < data.Length - 8)
+                {
+                    var header = ReadRecordHeader(data, offset);
+                    if (header.RecType == RT_Notes)
+                    {
+                        ParseNotesContainer(data, offset + 8, (int)header.RecLen);
+                    }
                 }
             }
         }
@@ -1250,10 +1276,14 @@ namespace Nefdev.PptToPptx
             {
                 var header = ReadRecordHeader(data, pos);
                 int recordEnd = pos + 8 + (int)header.RecLen;
+                int atomStart = pos + 8;
                 
                 if (header.RecType == RT_SlideAtom)
                 {
-                    // Basic slide info
+                    if (header.RecLen >= 12)
+                    {
+                        slide.SlideId = BitConverter.ToInt32(data, atomStart + 8);
+                    }
                 }
                 else if (header.RecType == ESCHER_DgContainer)
                 {
@@ -1269,10 +1299,51 @@ namespace Nefdev.PptToPptx
             }
         }
 
+        private void ParseNotesContainer(byte[] data, int start, int length)
+        {
+            int end = Math.Min(start + length, data.Length);
+            int pos = start;
+            int slideIdRef = -1;
+            var tempSlide = new Slide();
+            
+            while (pos + 8 <= end)
+            {
+                var header = ReadRecordHeader(data, pos);
+                int recordEnd = pos + 8 + (int)header.RecLen;
+                int atomStart = pos + 8;
+                
+                if (header.RecType == RT_NotesAtom)
+                {
+                    if (header.RecLen >= 4)
+                    {
+                        slideIdRef = BitConverter.ToInt32(data, atomStart);
+                    }
+                }
+                else if (header.RecType == ESCHER_DgContainer)
+                {
+                    ParseDrawingContainer(data, pos + 8, (int)header.RecLen, tempSlide);
+                }
+                
+                pos = recordEnd;
+                if (pos <= start) break;
+            }
+            
+            if (slideIdRef > 0 && tempSlide.TextContent.Count > 0)
+            {
+                string notesText = string.Join("\n", tempSlide.TextContent.ConvertAll(p => p.GetPlainText()));
+                if (!string.IsNullOrWhiteSpace(notesText))
+                {
+                    _notesIdMap[slideIdRef] = notesText;
+                }
+            }
+        }
+
         private void ParseDrawingContainer(byte[] data, int start, int length, Slide slide)
         {
             int end = Math.Min(start + length, data.Length);
             int pos = start;
+            
+            var shapesInThisContainer = new List<Shape>();
             
             while (pos + 8 <= end)
             {
@@ -1284,23 +1355,82 @@ namespace Nefdev.PptToPptx
                     var shape = ParseSpContainer(data, pos + 8, (int)header.RecLen);
                     if (shape != null)
                     {
-                        slide.Shapes.Add(shape);
-                        if (!string.IsNullOrEmpty(shape.Text))
-                        {
-                            var para = new TextParagraph();
-                            para.Runs.Add(new TextRun { Text = shape.Text });
-                            slide.TextContent.Add(para);
-                        }
+                        shapesInThisContainer.Add(shape);
                     }
                 }
                 else if (header.IsContainer)
                 {
+                    // For nested group containers (SpgrContainer)
                     ParseDrawingContainer(data, pos + 8, (int)header.RecLen, slide);
                 }
                 
                 pos = recordEnd;
                 if (pos <= start) break;
             }
+
+            // Post-process shapes in this container to detect tables
+            var finalShapes = TryDetectTable(shapesInThisContainer);
+            foreach (var shape in finalShapes)
+            {
+                slide.Shapes.Add(shape);
+                if (!string.IsNullOrEmpty(shape.Text))
+                {
+                    var para = new TextParagraph();
+                    para.Runs.Add(new TextRun { Text = shape.Text });
+                    slide.TextContent.Add(para);
+                }
+            }
+        }
+
+        private List<Shape> TryDetectTable(List<Shape> shapes)
+        {
+            if (shapes.Count == 0) return shapes;
+
+            // Simple table detection: If a group has many rectangles (cells)
+            // that are aligned in rows and columns.
+            var groupShape = shapes.FirstOrDefault(s => s.Type == "Group");
+            if (groupShape == null) return shapes;
+
+            var childShapes = shapes.Where(s => s != groupShape).ToList();
+            if (childShapes.Count < 2) return shapes;
+
+            // Group by Top position to find rows
+            var rows = childShapes
+                .GroupBy(s => s.Top)
+                .OrderBy(g => g.Key)
+                .ToList();
+
+            // Group by Left position to find columns
+            var cols = childShapes
+                .GroupBy(s => s.Left)
+                .OrderBy(g => g.Key)
+                .ToList();
+
+            // Threshold: If it's a grid (Rows * Cols approximately matches child count)
+            if (rows.Count > 1 && cols.Count > 1 && Math.Abs(rows.Count * cols.Count - childShapes.Count) <= 2)
+            {
+                var table = new Table();
+                foreach (var rowGroup in rows)
+                {
+                    var row = new TableRow();
+                    var sortedCells = rowGroup.OrderBy(s => s.Left).ToList();
+                    foreach (var cellShape in sortedCells)
+                    {
+                        var cell = new TableCell();
+                        cell.TextContent = cellShape.Paragraphs;
+                        cell.FillColor = cellShape.FillColor;
+                        row.Cells.Add(cell);
+                    }
+                    table.Rows.Add(row);
+                }
+
+                groupShape.Type = "Table";
+                groupShape.Table = table;
+                // Only return the Table (group) shape, discard individual cell shapes
+                return new List<Shape> { groupShape };
+            }
+
+            return shapes;
         }
 
         private void ParseEscherOpt(byte[] data, int start, int length, Shape shape)

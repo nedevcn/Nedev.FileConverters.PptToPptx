@@ -112,6 +112,8 @@ namespace Nefdev.PptToPptx
             Directory.CreateDirectory(Path.Combine(baseDir, "ppt", "slideMasters"));
             Directory.CreateDirectory(Path.Combine(baseDir, "ppt", "slideMasters", "_rels"));
             Directory.CreateDirectory(Path.Combine(baseDir, "ppt", "theme"));
+            Directory.CreateDirectory(Path.Combine(baseDir, "ppt", "notesSlides"));
+            Directory.CreateDirectory(Path.Combine(baseDir, "ppt", "notesSlides", "_rels"));
         }
         
         #region Content Types
@@ -143,6 +145,10 @@ namespace Nefdev.PptToPptx
             for (int i = 0; i < presentation.Slides.Count; i++)
             {
                 WriteOverride(writer, $"/ppt/slides/slide{i + 1}.xml", "application/vnd.openxmlformats-officedocument.presentationml.slide+xml");
+                if (!string.IsNullOrEmpty(presentation.Slides[i].Notes))
+                {
+                    WriteOverride(writer, $"/ppt/notesSlides/notesSlide{i + 1}.xml", "application/vnd.openxmlformats-officedocument.presentationml.notesSlide+xml");
+                }
             }
             
             // Override — slideLayout, slideMaster, theme
@@ -293,8 +299,15 @@ namespace Nefdev.PptToPptx
             var slides = presentation.Slides;
             for (int i = 0; i < slides.Count; i++)
             {
-                WriteSlideXml(baseDir, presentation, slides[i], i + 1);
-                WriteSlideRelationship(baseDir, presentation, slides[i], i + 1);
+                int slideNum = i + 1;
+                WriteSlideXml(baseDir, presentation, slides[i], slideNum);
+                WriteSlideRelationship(baseDir, presentation, slides[i], slideNum);
+                
+                if (!string.IsNullOrEmpty(slides[i].Notes))
+                {
+                    WriteNotesSlideXml(baseDir, slides[i], slideNum);
+                    WriteNotesSlideRelationships(baseDir, slideNum);
+                }
             }
         }
         
@@ -327,6 +340,10 @@ namespace Nefdev.PptToPptx
                     WriteChartFrame(writer, shape, shapeId, chartId);
                     WriteChartXml(baseDir, shape.Chart, chartId);
                     chartId++;
+                }
+                else if (shape.Type == "Table" && shape.Table != null)
+                {
+                    WriteGraphicFrame(writer, shape, shapeId);
                 }
                 else if (shape.Type == "Picture" && shape.ImageId != null)
                 {
@@ -540,6 +557,120 @@ namespace Nefdev.PptToPptx
             writer.WriteEndElement(); // txBody
             
             writer.WriteEndElement(); // sp
+        }
+
+        private void WriteGraphicFrame(XmlWriter writer, Shape shape, int shapeId)
+        {
+            writer.WriteStartElement("p", "graphicFrame", NS_P);
+            
+            writer.WriteStartElement("p", "nvGraphicFramePr", NS_P);
+            writer.WriteStartElement("p", "cNvPr", NS_P);
+            writer.WriteAttributeString("id", shapeId.ToString());
+            writer.WriteAttributeString("name", $"Table {shapeId}");
+            writer.WriteEndElement();
+            writer.WriteStartElement("p", "cNvGraphicFramePr", NS_P);
+            writer.WriteEndElement();
+            writer.WriteStartElement("p", "nvPr", NS_P);
+            writer.WriteEndElement();
+            writer.WriteEndElement();
+
+            writer.WriteStartElement("p", "xfrm", NS_P);
+            writer.WriteStartElement("a", "off", NS_A);
+            writer.WriteAttributeString("x", shape.Left.ToString());
+            writer.WriteAttributeString("y", shape.Top.ToString());
+            writer.WriteEndElement();
+            writer.WriteStartElement("a", "ext", NS_A);
+            writer.WriteAttributeString("cx", shape.Width.ToString());
+            writer.WriteAttributeString("cy", shape.Height.ToString());
+            writer.WriteEndElement();
+            writer.WriteEndElement();
+
+            writer.WriteStartElement("a", "graphic", NS_A);
+            writer.WriteStartElement("a", "graphicData", NS_A);
+            writer.WriteAttributeString("uri", "http://schemas.openxmlformats.org/drawingml/2006/table");
+
+            WriteTable(writer, shape.Table);
+
+            writer.WriteEndElement(); // graphicData
+            writer.WriteEndElement(); // graphic
+            
+            writer.WriteEndElement(); // graphicFrame
+        }
+
+        private void WriteTable(XmlWriter writer, Table table)
+        {
+            writer.WriteStartElement("a", "tbl", NS_A);
+            
+            writer.WriteStartElement("a", "tblPr", NS_A);
+            writer.WriteAttributeString("firstRow", "1");
+            writer.WriteAttributeString("bandRow", "1");
+            writer.WriteStartElement("a", "tableStyleId", NS_A);
+            writer.WriteString("{5C1824F4-7C08-47E0-8931-811103223AAE}"); // Medium Style 2 - Accent 1
+            writer.WriteEndElement();
+            writer.WriteEndElement();
+
+            // tblGrid
+            writer.WriteStartElement("a", "tblGrid", NS_A);
+            if (table.Rows.Count > 0)
+            {
+                int colCount = table.Rows[0].Cells.Count;
+                // Rough estimate for col width if not available
+                long gridColWidth = 9144000 / Math.Max(1, colCount); 
+                for (int i = 0; i < colCount; i++)
+                {
+                    writer.WriteStartElement("a", "gridCol", NS_A);
+                    writer.WriteAttributeString("w", gridColWidth.ToString());
+                    writer.WriteEndElement();
+                }
+            }
+            writer.WriteEndElement();
+
+            foreach (var row in table.Rows)
+            {
+                writer.WriteStartElement("a", "tr", NS_A);
+                writer.WriteAttributeString("h", "370840"); // Default row height
+
+                foreach (var cell in row.Cells)
+                {
+                    writer.WriteStartElement("a", "tc", NS_A);
+                    
+                    writer.WriteStartElement("a", "txBody", NS_A);
+                    writer.WriteStartElement("a", "bodyPr", NS_A);
+                    writer.WriteEndElement();
+                    writer.WriteStartElement("a", "lstStyle", NS_A);
+                    writer.WriteEndElement();
+
+                    if (cell.TextContent != null && cell.TextContent.Count > 0)
+                    {
+                        foreach (var para in cell.TextContent)
+                        {
+                            WriteParagraph(writer, para, 0, 0, 0);
+                        }
+                    }
+                    else
+                    {
+                        writer.WriteStartElement("a", "p", NS_A);
+                        writer.WriteEndElement();
+                    }
+                    writer.WriteEndElement(); // txBody
+
+                    writer.WriteStartElement("a", "tcPr", NS_A);
+                    if (!string.IsNullOrEmpty(cell.FillColor))
+                    {
+                        writer.WriteStartElement("a", "solidFill", NS_A);
+                        writer.WriteStartElement("a", "srgbClr", NS_A);
+                        writer.WriteAttributeString("val", cell.FillColor);
+                        writer.WriteEndElement();
+                        writer.WriteEndElement();
+                    }
+                    writer.WriteEndElement(); // tcPr
+
+                    writer.WriteEndElement(); // tc
+                }
+                writer.WriteEndElement(); // tr
+            }
+
+            writer.WriteEndElement(); // tbl
         }
 
         private void WritePictureShape(XmlWriter writer, Shape shape, int shapeId, int imageRid, int slideNum, int shapeIndex)
@@ -1128,12 +1259,95 @@ namespace Nefdev.PptToPptx
                     }
                 }
             }
+
+            if (!string.IsNullOrEmpty(slide.Notes))
+            {
+                WriteRelationship(writer, "rIdNotes", "http://schemas.openxmlformats.org/officeDocument/2006/relationships/notesSlide", $"../notesSlides/notesSlide{slideNum}.xml");
+            }
             
             writer.WriteEndElement();
             writer.WriteEndDocument();
         }
         
         #endregion
+
+        private void WriteNotesSlideXml(string baseDir, Slide slide, int slideNum)
+        {
+            string notesPath = Path.Combine(baseDir, "ppt", "notesSlides", $"notesSlide{slideNum}.xml");
+            using var writer = XmlWriter.Create(notesPath, new XmlWriterSettings { Indent = true });
+
+            writer.WriteStartDocument();
+            writer.WriteStartElement("p", "notes", NS_P);
+            writer.WriteAttributeString("xmlns", "a", null, NS_A);
+            writer.WriteAttributeString("xmlns", "r", null, NS_R);
+            writer.WriteAttributeString("xmlns", "p", null, NS_P);
+
+            writer.WriteStartElement("p", "cSld", NS_P);
+            writer.WriteStartElement("p", "spTree", NS_P);
+            
+            // nvGrpSpPr and grpSpPr via helper
+            WriteGroupShapeProperties(writer);
+
+            // Notes Textbox
+            writer.WriteStartElement("p", "sp", NS_P);
+            writer.WriteStartElement("p", "nvSpPr", NS_P);
+            writer.WriteStartElement("p", "cNvPr", NS_P);
+            writer.WriteAttributeString("id", "2");
+            writer.WriteAttributeString("name", "Notes Placeholder");
+            writer.WriteEndElement();
+            writer.WriteStartElement("p", "cNvSpPr", NS_P);
+            writer.WriteStartElement("a", "spLocks", NS_A);
+            writer.WriteAttributeString("noGrp", "1");
+            writer.WriteEndElement();
+            writer.WriteEndElement();
+            writer.WriteStartElement("p", "nvPr", NS_P);
+            writer.WriteStartElement("p", "ph", NS_P);
+            writer.WriteAttributeString("type", "body");
+            writer.WriteAttributeString("idx", "1");
+            writer.WriteEndElement();
+            writer.WriteEndElement();
+            writer.WriteEndElement(); // nvSpPr
+
+            writer.WriteStartElement("p", "spPr", NS_P);
+            writer.WriteEndElement();
+
+            writer.WriteStartElement("p", "txBody", NS_P);
+            writer.WriteStartElement("a", "bodyPr", NS_A);
+            writer.WriteEndElement();
+            writer.WriteStartElement("a", "lstStyle", NS_A);
+            writer.WriteEndElement();
+            writer.WriteStartElement("a", "p", NS_A);
+            writer.WriteStartElement("a", "r", NS_A);
+            writer.WriteStartElement("a", "t", NS_A);
+            writer.WriteString(slide.Notes);
+            writer.WriteEndElement();
+            writer.WriteEndElement();
+            writer.WriteEndElement();
+            writer.WriteEndElement(); // txBody
+            writer.WriteEndElement(); // sp
+
+            writer.WriteEndElement(); // spTree
+            writer.WriteEndElement(); // cSld
+
+            writer.WriteEndElement(); // notes
+        }
+
+        private void WriteNotesSlideRelationships(string baseDir, int slideNum)
+        {
+            string relsPath = Path.Combine(baseDir, "ppt", "notesSlides", "_rels", $"notesSlide{slideNum}.xml.rels");
+            using var writer = XmlWriter.Create(relsPath, new XmlWriterSettings { Indent = true });
+
+            writer.WriteStartDocument();
+            writer.WriteStartElement("Relationships", "http://schemas.openxmlformats.org/package/2006/relationships");
+
+            writer.WriteStartElement("Relationship", "http://schemas.openxmlformats.org/package/2006/relationships");
+            writer.WriteAttributeString("Id", "rId1");
+            writer.WriteAttributeString("Type", "http://schemas.openxmlformats.org/package/2006/relationships/slide");
+            writer.WriteAttributeString("Target", $"../slides/slide{slideNum}.xml");
+            writer.WriteEndElement();
+
+            writer.WriteEndElement();
+        }
         
         #region SlideLayout / SlideMaster / Theme
         
