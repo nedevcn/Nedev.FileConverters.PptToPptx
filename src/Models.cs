@@ -50,6 +50,7 @@ namespace Nefdev.PptToPptx
         
         // Table content
         public Table Table { get; set; }
+        public bool IsNativeTable { get; set; }
 
         // 图片引用
         public int? ImageId { get; set; }
@@ -175,7 +176,12 @@ namespace Nefdev.PptToPptx
     public class Table
     {
         public List<TableRow> Rows { get; set; }
-        public Table() { Rows = new List<TableRow>(); }
+        public List<long> ColumnWidths { get; set; }
+        public Table() 
+        { 
+            Rows = new List<TableRow>(); 
+            ColumnWidths = new List<long>();
+        }
     }
 
     public class TableRow

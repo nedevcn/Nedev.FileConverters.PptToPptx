@@ -654,7 +654,16 @@ namespace Nefdev.PptToPptx
 
             // tblGrid
             writer.WriteStartElement("a", "tblGrid", NS_A);
-            if (table.Rows.Count > 0)
+            if (table.ColumnWidths.Count > 0)
+            {
+                foreach (var width in table.ColumnWidths)
+                {
+                    writer.WriteStartElement("a", "gridCol", NS_A);
+                    writer.WriteAttributeString("w", width.ToString());
+                    writer.WriteEndElement();
+                }
+            }
+            else if (table.Rows.Count > 0)
             {
                 int colCount = table.Rows[0].Cells.Count;
                 // Rough estimate for col width if not available

@@ -58,6 +58,12 @@ namespace Nefdev.PptToPptx
         private const ushort RT_ExOleLink = 4036;      // ExOleLink container
         private const ushort RT_ExObjListAtom = 1034;  // ExObjList atom
         
+        // Programmable Tags
+        private const ushort RT_ProgTags = 5000;
+        private const ushort RT_ProgStringTag = 5001;
+        private const ushort RT_ProgBinaryTag = 5002;
+        private const ushort RT_BinaryTagData = 5003;
+        
         // Escher record types
         private const ushort ESCHER_DggContainer = 0xF000;
         private const ushort ESCHER_BStoreContainer = 0xF001;
@@ -1278,6 +1284,9 @@ namespace Nefdev.PptToPptx
                                 Console.WriteLine($"Parsed chart from exObjId={exObjId}: {chart.Series.Count} series");
                             }
                         }
+                        
+                        // Check for Programmable Tags (Table detection)
+                        ParseProgTags(data, atomStart, (int)header.RecLen, shape);
                         break;
                 }
                 
@@ -1396,6 +1405,53 @@ namespace Nefdev.PptToPptx
             
             slide.Transition = transition;
             Console.WriteLine($"Parsed Slide Transition: {transition.Type}, speed={transition.Speed}, autoAdvance={transition.HasAutoAdvance} ({transition.AdvanceTime}ms)");
+        }
+
+        private void ParseProgTags(byte[] data, int start, int length, Shape shape)
+        {
+            int end = Math.Min(start + length, data.Length);
+            int pos = start;
+
+            while (pos + 8 <= end)
+            {
+                var header = ReadRecordHeader(data, pos);
+                int recordEnd = pos + 8 + (int)header.RecLen;
+                int atomStart = pos + 8;
+
+                if (header.RecType == RT_ProgTags)
+                {
+                    ParseProgTags(data, atomStart, (int)header.RecLen, shape);
+                }
+                else if (header.RecType == RT_ProgBinaryTag)
+                {
+                    // ProgBinaryTag contains a CString for tagName and a BinaryTagData for data
+                    string tagName = "";
+                    int subPos = atomStart;
+                    int subEnd = recordEnd;
+                    while (subPos + 8 <= subEnd)
+                    {
+                        var subHeader = ReadRecordHeader(data, subPos);
+                        int subAtomStart = subPos + 8;
+                        if (subHeader.RecType == RT_CString)
+                        {
+                            tagName = Encoding.Unicode.GetString(data, subAtomStart, (int)subHeader.RecLen).TrimEnd('\0');
+                        }
+                        else if (subHeader.RecType == RT_BinaryTagData)
+                        {
+                            if (tagName == "___PPT10" || tagName == "___PPT12")
+                            {
+                                // This is a native table indicator
+                                shape.IsNativeTable = true;
+                                Console.WriteLine($"Detected Native Table via {tagName}");
+                            }
+                        }
+                        subPos += 8 + (int)subHeader.RecLen;
+                    }
+                }
+
+                pos = recordEnd;
+                if (pos <= start) break;
+            }
         }
 
         private ColorScheme ParseColorSchemeAtom(byte[] data, int start, int length)
@@ -1538,7 +1594,10 @@ namespace Nefdev.PptToPptx
                 .ToList();
 
             // Threshold: If it's a grid (Rows * Cols approximately matches child count)
-            if (rows.Count > 1 && cols.Count > 1 && Math.Abs(rows.Count * cols.Count - childShapes.Count) <= 2)
+            // Or if it was explicitly marked as a native table via ProgTags
+            bool isHeuristicTable = rows.Count > 1 && cols.Count > 1 && Math.Abs(rows.Count * cols.Count - childShapes.Count) <= 2;
+            
+            if (groupShape.IsNativeTable || isHeuristicTable)
             {
                 var table = new Table();
                 foreach (var rowGroup in rows)
@@ -1553,6 +1612,13 @@ namespace Nefdev.PptToPptx
                         row.Cells.Add(cell);
                     }
                     table.Rows.Add(row);
+                }
+
+                // Populate ColumnWidths based on the columns we found
+                foreach (var colGroup in cols)
+                {
+                    var firstCellInCol = colGroup.First();
+                    table.ColumnWidths.Add(firstCellInCol.Width);
                 }
 
                 groupShape.Type = "Table";
