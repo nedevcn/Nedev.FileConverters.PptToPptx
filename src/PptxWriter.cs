@@ -66,7 +66,7 @@ namespace Nefdev.PptToPptx
                 WriteSlideLayoutRelationships(tempDir, presentation);
                 WriteSlideMasters(tempDir, presentation);
                 WriteSlideMasterRelationships(tempDir, presentation);
-                WriteTheme(tempDir);
+                WriteTheme(tempDir, presentation);
                 WriteCoreProperties(tempDir);
                 WriteExtendedProperties(tempDir);
                 
@@ -401,8 +401,39 @@ namespace Nefdev.PptToPptx
             
             writer.WriteEndElement(); // spTree
             writer.WriteEndElement(); // cSld
+            
+            // 写入切换动画
+            if (slide.Transition != null)
+            {
+                WriteTransitionXml(writer, slide.Transition);
+            }
+            
             writer.WriteEndElement(); // sld
             writer.WriteEndDocument();
+        }
+        
+        private void WriteTransitionXml(XmlWriter writer, SlideTransition transition)
+        {
+            writer.WriteStartElement("p", "transition", NS_P);
+            
+            if (transition.Speed != "fast")
+            {
+                writer.WriteAttributeString("spd", transition.Speed);
+            }
+            
+            if (transition.HasAutoAdvance && transition.AdvanceTime > 0)
+            {
+                writer.WriteAttributeString("p", "advTm", NS_P, transition.AdvanceTime.ToString());
+            }
+            
+            // write the specific transition effect element
+            if (transition.Type != "none")
+            {
+                writer.WriteStartElement("p", transition.Type, NS_P);
+                writer.WriteEndElement();
+            }
+            
+            writer.WriteEndElement(); // transition
         }
         
         private void WriteGroupShapeProperties(XmlWriter writer)
@@ -1530,10 +1561,29 @@ namespace Nefdev.PptToPptx
             }
         }
         
-        private void WriteTheme(string baseDir)
+        private void WriteTheme(string baseDir, Presentation presentation)
         {
             var path = Path.Combine(baseDir, "ppt", "theme", "theme1.xml");
             using var writer = XmlWriter.Create(path, new XmlWriterSettings { Indent = true });
+            
+            // Look for a color scheme in the first master slide, or fallback to default Office Colors
+            ColorScheme scheme = null;
+            if (presentation.Masters.Count > 0 && presentation.Masters[0].ColorScheme != null)
+            {
+                scheme = presentation.Masters[0].ColorScheme;
+            }
+            // Use defaults if none found
+            scheme ??= new ColorScheme()
+            {
+                Background = "FFFFFF",
+                TextAndLines = "000000",
+                Shadows = "44546A", // Actually dk2 in PPTX usually
+                TitleText = "E7E6E6", // Actually lt2 in PPTX usually
+                Fills = "4472C4",
+                Accent = "ED7D31",
+                AccentAndHyperlink = "0563C1",
+                AccentAndFollowingHyperlink = "954F72"
+            };
             
             writer.WriteStartDocument(true);
             writer.WriteStartElement("a", "theme", NS_A);
@@ -1545,18 +1595,19 @@ namespace Nefdev.PptToPptx
             writer.WriteStartElement("a", "clrScheme", NS_A);
             writer.WriteAttributeString("name", "Office");
             
-            WriteColorElement(writer, "dk1", "000000");
-            WriteColorElement(writer, "lt1", "FFFFFF");
-            WriteColorElement(writer, "dk2", "44546A");
-            WriteColorElement(writer, "lt2", "E7E6E6");
-            WriteColorElement(writer, "accent1", "4472C4");
-            WriteColorElement(writer, "accent2", "ED7D31");
-            WriteColorElement(writer, "accent3", "A5A5A5");
+            // Map legacy color scheme to PPTX theme colors
+            WriteColorElement(writer, "dk1", scheme.TextAndLines);
+            WriteColorElement(writer, "lt1", scheme.Background);
+            WriteColorElement(writer, "dk2", scheme.TitleText);
+            WriteColorElement(writer, "lt2", scheme.Shadows);
+            WriteColorElement(writer, "accent1", scheme.Fills);
+            WriteColorElement(writer, "accent2", scheme.Accent);
+            WriteColorElement(writer, "accent3", "A5A5A5"); // Fallbacks for extra PPTX accents
             WriteColorElement(writer, "accent4", "FFC000");
             WriteColorElement(writer, "accent5", "5B9BD5");
             WriteColorElement(writer, "accent6", "70AD47");
-            WriteColorElement(writer, "hlink", "0563C1");
-            WriteColorElement(writer, "folHlink", "954F72");
+            WriteColorElement(writer, "hlink", scheme.AccentAndHyperlink);
+            WriteColorElement(writer, "folHlink", scheme.AccentAndFollowingHyperlink);
             
             writer.WriteEndElement(); // clrScheme
             

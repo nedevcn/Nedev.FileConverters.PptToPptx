@@ -33,8 +33,10 @@ namespace Nefdev.PptToPptx
         private const ushort RT_SlideAtom = 1007;
         private const ushort RT_Notes = 1008;
         private const ushort RT_NotesAtom = 1009;
-        private const ushort RT_DocumentAtom = 1001;
         private const ushort RT_Environment = 1010;
+        private const ushort RT_SlideShowSlideInfoAtom = 1012;
+        private const ushort RT_DocumentAtom = 1001;
+        private const ushort RT_ColorSchemeAtom = 2032;
         private const ushort RT_FontCollection = 2005;
         private const ushort RT_FontEntityAtom = 4023;
         
@@ -340,6 +342,15 @@ namespace Nefdev.PptToPptx
                 if (header.RecType == RT_FontCollection)
                 {
                     ParseFontCollection(data, pos + 8, (int)header.RecLen);
+                }
+                else if (header.RecType == RT_ColorSchemeAtom)
+                {
+                    // For the environment, this defines the default presentation color scheme.
+                    // We can store it on a pseudo-slide or just the first master if needed later.
+                    // Since it's global, we just parse it as a proof of concept and 
+                    // will rely on the slide/master specific ones.
+                    var globalScheme = ParseColorSchemeAtom(data, pos + 8, (int)header.RecLen);
+                    Console.WriteLine("Parsed Environment Global ColorScheme");
                 }
                 else if (header.IsContainer)
                 {
@@ -1302,6 +1313,14 @@ namespace Nefdev.PptToPptx
                 {
                     ParseDrawingContainer(data, pos + 8, (int)header.RecLen, slide);
                 }
+                else if (header.RecType == RT_SlideShowSlideInfoAtom)
+                {
+                    ParseSlideShowSlideInfoAtom(data, atomStart, (int)header.RecLen, slide);
+                }
+                else if (header.RecType == RT_ColorSchemeAtom)
+                {
+                    slide.ColorScheme = ParseColorSchemeAtom(data, atomStart, (int)header.RecLen);
+                }
                 else if (header.IsContainer)
                 {
                     ParseSlideContainer(data, pos + 8, (int)header.RecLen, slide);
@@ -1310,6 +1329,105 @@ namespace Nefdev.PptToPptx
                 pos = recordEnd;
                 if (pos <= start) break;
             }
+        }
+        
+        private void ParseSlideShowSlideInfoAtom(byte[] data, int start, int length, Slide slide)
+        {
+            if (length < 24) return;
+            
+            // 0..3:  slideTime (ticks, 1 tick = 1/256s or ms depending on flags)
+            // 4..7:  soundIdRef
+            // 8..9:  effectDir
+            // 10..11: effectType
+            // 12..13: action
+            // 14..15: autoAdvanceTime (ticks)
+            // 16..19: flags
+            // 20..21: speed
+            
+            int effectType = BitConverter.ToInt16(data, start + 10);
+            int flags = BitConverter.ToInt32(data, start + 16);
+            int speedVal = BitConverter.ToInt16(data, start + 20);
+            int advanceTimeTicks = BitConverter.ToInt32(data, start);
+            
+            var transition = new SlideTransition();
+            
+            // 1. Map Speed: 0=Slow, 1=Medium, 2=Fast
+            transition.Speed = speedVal switch
+            {
+                0 => "slow",
+                1 => "med",
+                _ => "fast"
+            };
+            
+            // 2. Map Effect Type (basic PPTX mappings)
+            transition.Type = effectType switch
+            {
+                0 => "none",
+                1 => "cut",
+                2 => "cutThroughBlack",
+                513 => "blinds",
+                769 => "checker",
+                1025 => "cover",
+                1281 => "dissolve",
+                1537 => "fade",
+                1793 => "pull",
+                2049 => "randomBar",
+                2305 => "strips",
+                2561 => "wipe",
+                2817 => "box",
+                3073 => "wedge",
+                3329 => "split",
+                _ => (effectType >= 256 && effectType <= 512) ? "random" : "none"
+            };
+            
+            // 3. Flags mapping
+            // Bit 0x04: Has sound
+            // Bit 0x10: Has auto advance
+            bool hasAutoAdvance = (flags & 0x10) != 0;
+            transition.HasAutoAdvance = hasAutoAdvance;
+            
+            if (hasAutoAdvance)
+            {
+                // Typically slideTime is stored as "ticks" where 1 tick = 1 millisecond in modern files / BIFF8, 
+                // or 1/256 sec in older formats. For MS-PPT it's generally either milliseconds or ticks.
+                // However, autoAdvanceTime in PPT is often simply Milliseconds.
+                transition.AdvanceTime = advanceTimeTicks;
+            }
+            
+            slide.Transition = transition;
+            Console.WriteLine($"Parsed Slide Transition: {transition.Type}, speed={transition.Speed}, autoAdvance={transition.HasAutoAdvance} ({transition.AdvanceTime}ms)");
+        }
+
+        private ColorScheme ParseColorSchemeAtom(byte[] data, int start, int length)
+        {
+            if (length < 32) return null;
+
+            var scheme = new ColorScheme();
+            scheme.Background = GetColorHexStr(data, start);
+            scheme.TextAndLines = GetColorHexStr(data, start + 4);
+            scheme.Shadows = GetColorHexStr(data, start + 8);
+            scheme.TitleText = GetColorHexStr(data, start + 12);
+            scheme.Fills = GetColorHexStr(data, start + 16);
+            scheme.Accent = GetColorHexStr(data, start + 20);
+            scheme.AccentAndHyperlink = GetColorHexStr(data, start + 24);
+            scheme.AccentAndFollowingHyperlink = GetColorHexStr(data, start + 28);
+            
+            return scheme;
+        }
+
+        private string GetColorHexStr(byte[] data, int offset)
+        {
+            // PPT stores colors as an array of 4 bytes: R, G, B, _ (usually).
+            // This is effectively a standard COLORREF but reversed because COLORREF is usually 0x00bbggrr,
+            // while in memory here it's literally R G B _.
+            if (offset + 2 < data.Length)
+            {
+                byte r = data[offset];
+                byte g = data[offset + 1];
+                byte b = data[offset + 2];
+                return $"{r:X2}{g:X2}{b:X2}";
+            }
+            return "000000";
         }
 
         private void ParseNotesContainer(byte[] data, int start, int length)

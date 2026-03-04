@@ -23,6 +23,8 @@ namespace Nefdev.PptToPptx
         public List<Shape> Shapes { get; set; }
         public List<TextParagraph> TextContent { get; set; }
         public string Notes { get; set; }
+        public SlideTransition Transition { get; set; }
+        public ColorScheme ColorScheme { get; set; }
         
         public Slide()
         {
@@ -187,5 +189,33 @@ namespace Nefdev.PptToPptx
         public List<TextParagraph> TextContent { get; set; }
         public string FillColor { get; set; }
         public TableCell() { TextContent = new List<TextParagraph>(); }
+    }
+    
+    public class SlideTransition
+    {
+        public string Type { get; set; } // "fade", "push", "wipe", etc.
+        public string Speed { get; set; } // "slow", "med", "fast"
+        public int AdvanceTime { get; set; } // Time to auto-advance in ms
+        public bool HasAutoAdvance { get; set; }
+        
+        public SlideTransition()
+        {
+            Type = "none";
+            Speed = "fast";
+            AdvanceTime = 0;
+            HasAutoAdvance = false;
+        }
+    }
+    
+    public class ColorScheme
+    {
+        public string Background { get; set; } = "FFFFFF";
+        public string TextAndLines { get; set; } = "000000";
+        public string Shadows { get; set; } = "808080";
+        public string TitleText { get; set; } = "000000";
+        public string Fills { get; set; } = "00FF00";
+        public string Accent { get; set; } = "0000FF";
+        public string AccentAndHyperlink { get; set; } = "0000FF";
+        public string AccentAndFollowingHyperlink { get; set; } = "800080";
     }
 }
