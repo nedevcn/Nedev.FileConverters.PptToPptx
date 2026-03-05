@@ -25,6 +25,13 @@ namespace Nefdev.PptToPptx
         // Common format records
         private const ushort FORMAT = 0x041E;
 
+        // Workbook encoding
+        private const ushort CODEPAGE = 0x0042;
+
+        // Compact numeric records often used by MS Graph/Excel exports
+        private const ushort RK = 0x027E;
+        private const ushort MULRK = 0x00BD;
+
         // Chart sub-stream records for types and titles
         private const ushort CH_BAR = 0x1017;
         private const ushort CH_LINE = 0x1018;
@@ -56,6 +63,9 @@ namespace Nefdev.PptToPptx
 
             var sstStrings = new List<string>();
             var sstOffsets = new List<uint>();
+
+            int ansiCodePage = 1252; // default
+            Encoding ansiEncoding = Encoding.GetEncoding(1252);
 
             ChartSeries currentSeries = null;
             
@@ -99,12 +109,74 @@ namespace Nefdev.PptToPptx
                 {
                     switch (record.Id)
                     {
+                        case CODEPAGE:
+                            if (record.Data.Length >= 2)
+                            {
+                                ansiCodePage = BitConverter.ToUInt16(record.Data, 0);
+                                try
+                                {
+                                    ansiEncoding = Encoding.GetEncoding(ansiCodePage);
+                                }
+                                catch
+                                {
+                                    ansiCodePage = 1252;
+                                    ansiEncoding = Encoding.GetEncoding(1252);
+                                }
+                            }
+                            break;
+
                         case FORMAT:
                             // We could parse formats if needed
                             break;
                             
                         case SST:
                             ParseSstInfo(record, sstStrings, sstOffsets);
+                            break;
+
+                        case RK:
+                            {
+                                using var recStream = new MemoryStream(record.Data);
+                                using var recReader = new BinaryReader(recStream);
+                                ushort row = recReader.ReadUInt16();
+                                ushort col = recReader.ReadUInt16();
+                                ushort xf = recReader.ReadUInt16();
+                                uint rkVal = recReader.ReadUInt32();
+                                double val = DecodeRk(rkVal);
+                                numbers[(row, col)] = val;
+                                cells[(row, col)] = val.ToString();
+                            }
+                            break;
+
+                        case MULRK:
+                            {
+                                // [row:2][colFirst:2][(xf:2)(rk:4)]... [colLast:2]
+                                if (record.Data.Length >= 8)
+                                {
+                                    using var recStream = new MemoryStream(record.Data);
+                                    using var recReader = new BinaryReader(recStream);
+                                    ushort row = recReader.ReadUInt16();
+                                    ushort colFirst = recReader.ReadUInt16();
+
+                                    int entriesBytes = record.Data.Length - 4; // minus row+colFirst
+                                    if (entriesBytes >= 8)
+                                    {
+                                        int rkDataBytes = entriesBytes - 2; // minus colLast
+                                        int n = rkDataBytes / 6;
+                                        for (int i = 0; i < n; i++)
+                                        {
+                                            ushort xf = recReader.ReadUInt16();
+                                            uint rkVal = recReader.ReadUInt32();
+                                            ushort col = (ushort)(colFirst + i);
+                                            double val = DecodeRk(rkVal);
+                                            numbers[(row, col)] = val;
+                                            cells[(row, col)] = val.ToString();
+                                        }
+                                        // consume colLast (not strictly needed)
+                                        if (recStream.Position + 2 <= recStream.Length)
+                                            recReader.ReadUInt16();
+                                    }
+                                }
+                            }
                             break;
                             
                         case NUMBER:
@@ -122,7 +194,7 @@ namespace Nefdev.PptToPptx
                             
                         case LABEL:
                             {
-                                var stringReader = new BiffStringReader(record, 6); // Skip row, col, xf
+                                var stringReader = new BiffStringReader(record, 6, ansiCodePage); // Skip row, col, xf
                                 using var recStream = new MemoryStream(record.Data);
                                 using var recReader = new BinaryReader(recStream);
                                 ushort row = recReader.ReadUInt16();
@@ -261,7 +333,7 @@ namespace Nefdev.PptToPptx
                                         if (isUni)
                                             text = Encoding.Unicode.GetString(record.Data, 4, Math.Min(cch * 2, record.Data.Length - 4));
                                         else
-                                            text = Encoding.GetEncoding(1252).GetString(record.Data, 4, Math.Min(cch, record.Data.Length - 4));
+                                            text = ansiEncoding.GetString(record.Data, 4, Math.Min(cch, record.Data.Length - 4));
                                         
                                         if (!string.IsNullOrEmpty(text))
                                         {
@@ -365,7 +437,7 @@ namespace Nefdev.PptToPptx
             uint totalStrings = reader.ReadUInt32();
             uint uniqueStrings = reader.ReadUInt32();
             
-            var stringReader = new BiffStringReader(record, 8); // SST Header size is 8 bytes
+            var stringReader = new BiffStringReader(record, 8); // SST Header size is 8 bytes (ANSI is uncommon here; BIFF option flags drive Unicode)
             
             for (int i = 0; i < uniqueStrings; i++)
             {
@@ -380,6 +452,29 @@ namespace Nefdev.PptToPptx
                     if (strings.Count == i) strings.Add("");
                 }
             }
+        }
+
+        private static double DecodeRk(uint rk)
+        {
+            bool multiplyBy100 = (rk & 0x01) != 0;
+            bool isInteger = (rk & 0x02) != 0;
+
+            double val;
+            if (isInteger)
+            {
+                // Signed 30-bit integer stored in bits 2..31
+                int i = unchecked((int)rk);
+                val = (double)(i >> 2);
+            }
+            else
+            {
+                // IEEE 754 double: stored in bits 2..31 of rk as the high 30 bits of the 64-bit value.
+                long raw = ((long)(rk & 0xFFFFFFFC)) << 32;
+                val = BitConverter.Int64BitsToDouble(raw);
+            }
+
+            if (multiplyBy100) val /= 100.0;
+            return val;
         }
     }
 }

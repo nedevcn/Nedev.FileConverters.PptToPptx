@@ -10,14 +10,23 @@ namespace Nefdev.PptToPptx
     public class BiffStringReader
     {
         private readonly BiffRecord _record;
+        private readonly Encoding _ansiEncoding;
         private int _chunkIndex; // 0 = Data, 1+ = Continues[0...]
         private int _chunkOffset;
         
-        public BiffStringReader(BiffRecord record, int startOffset)
+        public BiffStringReader(BiffRecord record, int startOffset, int ansiCodePage = 1252)
         {
             _record = record;
             _chunkIndex = 0;
             _chunkOffset = startOffset;
+            try
+            {
+                _ansiEncoding = Encoding.GetEncoding(ansiCodePage);
+            }
+            catch
+            {
+                _ansiEncoding = Encoding.GetEncoding(1252);
+            }
         }
 
         public string ReadString()
@@ -85,7 +94,7 @@ namespace Nefdev.PptToPptx
                     }
                     else
                     {
-                        sb.Append(Encoding.GetEncoding(1252).GetString(chunkArray, _chunkOffset, charsToRead));
+                        sb.Append(_ansiEncoding.GetString(chunkArray, _chunkOffset, charsToRead));
                         _chunkOffset += charsToRead;
                     }
                     charsRemaining -= charsToRead;

@@ -3,6 +3,7 @@ using System.IO;
 using System.Linq;
 using System.Text;
 using System.Collections.Generic;
+using System.Globalization;
 
 namespace Nefdev.PptToPptx
 {
@@ -2588,15 +2589,16 @@ namespace Nefdev.PptToPptx
             
             try
             {
-                // PPT stores ANSI text using the system code page
-                // For Chinese systems this is GB2312/GBK (codepage 936)
-                var encoding = Encoding.GetEncoding(936);
+                // PPT stores ANSI text using the system ANSI code page.
+                // On Windows this matches the current culture's ANSI code page (e.g., 936 on zh-CN).
+                int ansiCp = CultureInfo.CurrentCulture.TextInfo.ANSICodePage;
+                var encoding = Encoding.GetEncoding(ansiCp);
                 return encoding.GetString(data, offset, byteCount).TrimEnd('\0');
             }
             catch
             {
-                // Fallback to Latin1 if GB2312 fails
-                try { return Encoding.Latin1.GetString(data, offset, byteCount).TrimEnd('\0'); }
+                // Fallbacks
+                try { return Encoding.GetEncoding(1252).GetString(data, offset, byteCount).TrimEnd('\0'); }
                 catch { return ""; }
             }
         }
