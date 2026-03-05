@@ -21,8 +21,9 @@ namespace Nefdev.PptToPptx
         private List<int> _miniFat = new List<int>();
         private byte[] _miniStreamData;
         public IReadOnlyList<DirectoryEntry> DirectoryList => _directoryList;
-        private List<DirectoryEntry> _directoryList = new List<DirectoryEntry>();
-        private Dictionary<string, DirectoryEntry> _directoryEntries = new Dictionary<string, DirectoryEntry>();
+        private readonly List<DirectoryEntry> _directoryList = new List<DirectoryEntry>(); // non-empty entries for enumeration
+        private readonly List<DirectoryEntry> _directoryBySid = new List<DirectoryEntry>(); // includes empties to preserve SID indexing
+        private readonly Dictionary<string, List<int>> _nameToSids = new Dictionary<string, List<int>>(StringComparer.OrdinalIgnoreCase);
         
         private const int END_OF_CHAIN = -2;       // 0xFFFFFFFE
         private const int FREE_SECT = -1;           // 0xFFFFFFFF
@@ -157,8 +158,19 @@ namespace Nefdev.PptToPptx
         private void BuildMiniStream()
         {
             // Mini Stream 存在 Root Entry 的流中
-            if (_directoryList.Count == 0) return;
-            var rootEntry = _directoryList[0];
+            if (_directoryBySid.Count == 0) return;
+
+            DirectoryEntry rootEntry = null;
+            for (int i = 0; i < _directoryBySid.Count; i++)
+            {
+                if (_directoryBySid[i].Type == DirectoryEntryType.RootStorage)
+                {
+                    rootEntry = _directoryBySid[i];
+                    break;
+                }
+            }
+            rootEntry ??= _directoryBySid[0];
+
             if (rootEntry.StartSector == END_OF_CHAIN || rootEntry.StartSector == FREE_SECT)
                 return;
                 
@@ -183,6 +195,7 @@ namespace Nefdev.PptToPptx
         private void ReadDirectoryEntries()
         {
             int currentSector = _firstDirectorySector;
+            int sid = 0;
             while (currentSector != END_OF_CHAIN && currentSector != FREE_SECT)
             {
                 byte[] directorySectorData = ReadSectorData(currentSector);
@@ -193,12 +206,21 @@ namespace Nefdev.PptToPptx
                     byte[] entryData = new byte[128];
                     Array.Copy(directorySectorData, i * 128, entryData, 0, 128);
                     
-                    DirectoryEntry entry = new DirectoryEntry(entryData);
+                    DirectoryEntry entry = new DirectoryEntry(entryData, sid);
+                    _directoryBySid.Add(entry);
+
                     if (entry.Type != DirectoryEntryType.Empty && entry.Name.Length > 0)
                     {
                         _directoryList.Add(entry);
-                        _directoryEntries[entry.Name] = entry;
+                        if (!_nameToSids.TryGetValue(entry.Name, out var list))
+                        {
+                            list = new List<int>();
+                            _nameToSids[entry.Name] = list;
+                        }
+                        list.Add(entry.Sid);
                     }
+
+                    sid++;
                 }
                 
                 currentSector = GetNextSector(currentSector);
@@ -207,9 +229,18 @@ namespace Nefdev.PptToPptx
         
         public Stream GetStream(string streamName)
         {
-            if (_directoryEntries.TryGetValue(streamName, out DirectoryEntry entry))
+            if (_nameToSids.TryGetValue(streamName, out var sids))
             {
-                return GetStream(entry);
+                // Prefer a user stream when names collide.
+                foreach (var sid in sids)
+                {
+                    var e = GetEntryBySid(sid);
+                    if (e != null && e.Type == DirectoryEntryType.UserStream)
+                        return GetStream(e);
+                }
+                var entry = GetEntryBySid(sids[0]);
+                if (entry != null)
+                    return GetStream(entry);
             }
             return null;
         }
@@ -237,7 +268,7 @@ namespace Nefdev.PptToPptx
             var result = new List<DirectoryEntry>();
             foreach (var entry in _directoryList)
             {
-                if (entry.Name == name)
+                if (string.Equals(entry.Name, name, StringComparison.OrdinalIgnoreCase))
                 {
                     result.Add(entry);
                 }
@@ -246,31 +277,43 @@ namespace Nefdev.PptToPptx
         }
         
         /// <summary>
-        /// Find a child stream by name inside a storage entry.
-        /// In OLE compound files, child entries follow the storage entry in the directory list.
+        /// Find a child stream by name inside a storage entry (CFB directory tree).
         /// </summary>
         public Stream GetChildStream(string storageName, string streamName)
         {
-            bool inStorage = false;
-            foreach (var entry in _directoryList)
-            {
-                if (entry.Name == storageName && entry.Type == DirectoryEntryType.UserStorage)
-                {
-                    inStorage = true;
-                    continue;
-                }
-                if (inStorage)
-                {
-                    // Stop when we hit another storage or root
-                    if (entry.Type == DirectoryEntryType.UserStorage || entry.Type == DirectoryEntryType.RootStorage)
-                        break;
-                    if (entry.Name == streamName && entry.Type == DirectoryEntryType.UserStream)
-                    {
-                        return GetStream(entry);
-                    }
-                }
-            }
+            var storage = FindStorageEntry(storageName);
+            if (storage == null) return null;
+
+            var child = FindDirectChildByName(storage, streamName, DirectoryEntryType.UserStream);
+            if (child != null)
+                return GetStream(child);
+
             return null;
+        }
+
+        /// <summary>
+        /// Return direct child entries of a storage/root (streams + storages).
+        /// </summary>
+        public List<DirectoryEntry> GetChildEntries(string storageName)
+        {
+            var storage = FindStorageEntry(storageName);
+            if (storage == null) return new List<DirectoryEntry>();
+            return GetChildEntries(storage);
+        }
+
+        public List<DirectoryEntry> GetChildEntries(DirectoryEntry storageEntry)
+        {
+            var result = new List<DirectoryEntry>();
+            if (storageEntry == null) return result;
+            if (storageEntry.Type != DirectoryEntryType.UserStorage && storageEntry.Type != DirectoryEntryType.RootStorage)
+                return result;
+
+            foreach (var child in EnumerateSiblingTree(storageEntry.ChildSid))
+            {
+                if (child.Type != DirectoryEntryType.Empty && child.Name.Length > 0)
+                    result.Add(child);
+            }
+            return result;
         }
 
         /// <summary>
@@ -297,6 +340,75 @@ namespace Nefdev.PptToPptx
                 names.Add($"[{entry.Type}] {entry.Name} (sector={entry.StartSector}, size={entry.Size})");
             }
             return names;
+        }
+
+        private DirectoryEntry GetEntryBySid(int sid)
+        {
+            if (sid < 0 || sid >= _directoryBySid.Count) return null;
+            return _directoryBySid[sid];
+        }
+
+        private DirectoryEntry FindStorageEntry(string storageName)
+        {
+            if (string.IsNullOrEmpty(storageName)) return null;
+
+            if (_nameToSids.TryGetValue(storageName, out var sids))
+            {
+                foreach (var sid in sids)
+                {
+                    var e = GetEntryBySid(sid);
+                    if (e != null && (e.Type == DirectoryEntryType.UserStorage || e.Type == DirectoryEntryType.RootStorage))
+                        return e;
+                }
+            }
+
+            // Fallback: linear scan (case-insensitive)
+            foreach (var entry in _directoryList)
+            {
+                if ((entry.Type == DirectoryEntryType.UserStorage || entry.Type == DirectoryEntryType.RootStorage) &&
+                    string.Equals(entry.Name, storageName, StringComparison.OrdinalIgnoreCase))
+                    return entry;
+            }
+
+            return null;
+        }
+
+        private DirectoryEntry FindDirectChildByName(DirectoryEntry storageEntry, string childName, DirectoryEntryType requiredType)
+        {
+            if (storageEntry == null || string.IsNullOrEmpty(childName)) return null;
+
+            foreach (var child in EnumerateSiblingTree(storageEntry.ChildSid))
+            {
+                if (child.Type == requiredType && string.Equals(child.Name, childName, StringComparison.OrdinalIgnoreCase))
+                    return child;
+            }
+            return null;
+        }
+
+        /// <summary>
+        /// Enumerate nodes in a directory sibling red-black tree (left/right only).
+        /// This is used to enumerate direct children of a storage whose ChildSid points to the tree root.
+        /// </summary>
+        private IEnumerable<DirectoryEntry> EnumerateSiblingTree(int rootSid)
+        {
+            if (rootSid < 0) yield break;
+
+            var stack = new Stack<int>();
+            var visited = new HashSet<int>();
+            stack.Push(rootSid);
+
+            while (stack.Count > 0)
+            {
+                int sid = stack.Pop();
+                if (sid < 0 || sid >= _directoryBySid.Count) continue;
+                if (!visited.Add(sid)) continue;
+
+                var entry = _directoryBySid[sid];
+                yield return entry;
+
+                if (entry.LeftSiblingSid >= 0) stack.Push(entry.LeftSiblingSid);
+                if (entry.RightSiblingSid >= 0) stack.Push(entry.RightSiblingSid);
+            }
         }
         
         private byte[] ReadStreamData(int startSector, long size)
@@ -358,13 +470,18 @@ namespace Nefdev.PptToPptx
         
         public class DirectoryEntry
         {
+            public int Sid { get; private set; }
             public string Name { get; private set; }
             public DirectoryEntryType Type { get; private set; }
+            public int LeftSiblingSid { get; private set; }
+            public int RightSiblingSid { get; private set; }
+            public int ChildSid { get; private set; }
             public int StartSector { get; private set; }
             public long Size { get; private set; }
             
-            public DirectoryEntry(byte[] data)
+            public DirectoryEntry(byte[] data, int sid)
             {
+                Sid = sid;
                 // 名称长度 (offset 64, 2 bytes) — Unicode 字符数 including null
                 int nameLen = BitConverter.ToUInt16(data, 64);
                 if (nameLen > 2)
@@ -383,12 +500,24 @@ namespace Nefdev.PptToPptx
                 
                 // 类型 (offset 66, 1 byte)
                 Type = (DirectoryEntryType)(data[66] & 0xFF);
+
+                // Sibling/child pointers (CFB directory red-black tree)
+                LeftSiblingSid = BitConverter.ToInt32(data, 68);
+                RightSiblingSid = BitConverter.ToInt32(data, 72);
+                ChildSid = BitConverter.ToInt32(data, 76);
                 
                 // 起始扇区 (offset 116, 4 bytes)
                 StartSector = BitConverter.ToInt32(data, 116);
                 
-                // 大小 (offset 120, 4 bytes) — v3 格式使用 32-bit
-                Size = BitConverter.ToUInt32(data, 120);
+                // 大小 (offset 120, 8 bytes) — v3 uses low 32 bits, v4 uses 64-bit
+                try
+                {
+                    Size = (long)BitConverter.ToUInt64(data, 120);
+                }
+                catch
+                {
+                    Size = BitConverter.ToUInt32(data, 120);
+                }
             }
         }
     }

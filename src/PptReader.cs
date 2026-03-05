@@ -951,24 +951,8 @@ namespace Nefdev.PptToPptx
 
         private List<OleCompoundFile.DirectoryEntry> GetChildStreamEntries(string storageName)
         {
-            var result = new List<OleCompoundFile.DirectoryEntry>();
-            if (_oleFile == null) return result;
-            bool inStorage = false;
-            foreach (var entry in _oleFile.DirectoryList)
-            {
-                if (entry.Name == storageName && entry.Type == OleCompoundFile.DirectoryEntryType.UserStorage)
-                {
-                    inStorage = true;
-                    continue;
-                }
-                if (inStorage)
-                {
-                    if (entry.Type == OleCompoundFile.DirectoryEntryType.UserStorage || entry.Type == OleCompoundFile.DirectoryEntryType.RootStorage)
-                        break;
-                    result.Add(entry);
-                }
-            }
-            return result;
+            if (_oleFile == null) return new List<OleCompoundFile.DirectoryEntry>();
+            return _oleFile.GetChildEntries(storageName);
         }
 
         private OleCompoundFile.DirectoryEntry GetChildStreamEntry(string storageName, string streamName)

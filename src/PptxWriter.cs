@@ -9,6 +9,7 @@ namespace Nefdev.PptToPptx
     public class PptxWriter : IDisposable
     {
         private readonly string _outputPath;
+        private readonly Dictionary<Shape, int> _chartPartIdMap = new Dictionary<Shape, int>();
         
         // 命名空间常量
         private const string NS_P = "http://schemas.openxmlformats.org/presentationml/2006/main";
@@ -52,6 +53,8 @@ namespace Nefdev.PptToPptx
                 {
                     presentation.Slides.Add(new Slide { Index = 1 });
                 }
+
+                BuildChartPartMap(presentation);
                 
                 CreateDirectoryStructure(tempDir, presentation);
                 WriteContentTypes(tempDir, presentation);
@@ -83,22 +86,60 @@ namespace Nefdev.PptToPptx
             }
             finally
             {
-                // 调试：复制临时目录
-                string copyDir = Path.Combine(Path.GetDirectoryName(_outputPath), "temp_pptx");
-                if (Directory.Exists(copyDir))
-                    Directory.Delete(copyDir, recursive: true);
-                Directory.CreateDirectory(copyDir);
-                
-                foreach (var file in Directory.GetFiles(tempDir, "*.*", SearchOption.AllDirectories))
+                if (ShouldKeepTempFiles())
                 {
-                    string relativePath = Path.GetRelativePath(tempDir, file);
-                    string destPath = Path.Combine(copyDir, relativePath);
-                    Directory.CreateDirectory(Path.GetDirectoryName(destPath));
-                    File.Copy(file, destPath);
+                    string copyDir = Path.Combine(Path.GetDirectoryName(_outputPath), "temp_pptx");
+                    Directory.CreateDirectory(copyDir);
+
+                    foreach (var file in Directory.GetFiles(tempDir, "*.*", SearchOption.AllDirectories))
+                    {
+                        string relativePath = Path.GetRelativePath(tempDir, file);
+                        string destPath = Path.Combine(copyDir, relativePath);
+                        Directory.CreateDirectory(Path.GetDirectoryName(destPath));
+                        File.Copy(file, destPath, overwrite: true);
+                    }
                 }
-                
+
                 Directory.Delete(tempDir, recursive: true);
             }
+        }
+
+        private bool ShouldKeepTempFiles()
+        {
+            // Opt-in only. Useful for debugging invalid packages.
+            // Set NPPTTOPPTX_KEEP_TEMP=1 to keep a copy under "temp_pptx" next to the output file.
+            return string.Equals(Environment.GetEnvironmentVariable("NPPTTOPPTX_KEEP_TEMP"), "1", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private void BuildChartPartMap(Presentation presentation)
+        {
+            _chartPartIdMap.Clear();
+            if (presentation == null) return;
+
+            int nextChartId = 1;
+            foreach (var slide in presentation.Slides)
+            {
+                foreach (var shape in slide.Shapes)
+                {
+                    if (shape?.Type == "Chart" && shape.Chart != null && !_chartPartIdMap.ContainsKey(shape))
+                        _chartPartIdMap[shape] = nextChartId++;
+                }
+            }
+
+            foreach (var master in presentation.Masters)
+            {
+                foreach (var shape in master.Shapes)
+                {
+                    if (shape?.Type == "Chart" && shape.Chart != null && !_chartPartIdMap.ContainsKey(shape))
+                        _chartPartIdMap[shape] = nextChartId++;
+                }
+            }
+        }
+
+        private int GetChartPartId(Shape chartShape)
+        {
+            if (chartShape == null) return 0;
+            return _chartPartIdMap.TryGetValue(chartShape, out int id) ? id : 0;
         }
         
         private void CreateDirectoryStructure(string baseDir, Presentation presentation)
@@ -186,7 +227,7 @@ namespace Nefdev.PptToPptx
             WriteOverride(writer, "/docProps/app.xml", "application/vnd.openxmlformats-officedocument.extended-properties+xml");
             
             // Charts (动态)
-            int chartCount = CountCharts(presentation);
+            int chartCount = _chartPartIdMap.Count > 0 ? _chartPartIdMap.Count : CountCharts(presentation);
             for (int i = 0; i < chartCount; i++)
             {
                 WriteOverride(writer, $"/ppt/charts/chart{i + 1}.xml", "application/vnd.openxmlformats-officedocument.drawingml.chart+xml");
@@ -386,7 +427,7 @@ namespace Nefdev.PptToPptx
             
             // 写入形状
             int shapeId = 2;  // 1 is reserved for the group shape
-            int chartId = 1;
+            int chartRelId = 2; // rId1 is reserved for slideLayout
             int imageRid = 100; // Start high for images to avoid collision
             
             // 先写入 slide 形状
@@ -394,9 +435,11 @@ namespace Nefdev.PptToPptx
             {
                 if (shape.Type == "Chart" && shape.Chart != null)
                 {
-                    WriteChartFrame(writer, shape, shapeId, chartId);
-                    WriteChartXml(baseDir, shape.Chart, chartId);
-                    chartId++;
+                    int partId = GetChartPartId(shape);
+                    if (partId <= 0) partId = chartRelId; // fallback (should not happen if prepass ran)
+                    WriteChartFrame(writer, shape, shapeId, chartRelId, partId);
+                    WriteChartXml(baseDir, shape.Chart, partId);
+                    chartRelId++;
                 }
                 else if (shape.Type == "Table" && shape.Table != null)
                 {
@@ -1255,7 +1298,7 @@ namespace Nefdev.PptToPptx
         
         #region Charts
         
-        private void WriteChartFrame(XmlWriter writer, Shape shape, int shapeId, int chartId)
+        private void WriteChartFrame(XmlWriter writer, Shape shape, int shapeId, int chartRelId, int chartPartId)
         {
             // 图表使用 graphicFrame 而不是 sp
             writer.WriteStartElement("p", "graphicFrame", NS_P);
@@ -1265,7 +1308,7 @@ namespace Nefdev.PptToPptx
             
             writer.WriteStartElement("p", "cNvPr", NS_P);
             writer.WriteAttributeString("id", shapeId.ToString());
-            writer.WriteAttributeString("name", $"Chart {chartId}");
+            writer.WriteAttributeString("name", $"Chart {chartPartId}");
             writer.WriteEndElement();
             
             writer.WriteStartElement("p", "cNvGraphicFramePr", NS_P);
@@ -1295,7 +1338,7 @@ namespace Nefdev.PptToPptx
             
             writer.WriteStartElement("c", "chart", NS_C);
             writer.WriteAttributeString("xmlns", "c", null, NS_C);
-            writer.WriteAttributeString("r", "id", NS_R, $"rId{chartId}");
+            writer.WriteAttributeString("r", "id", NS_R, $"rId{chartRelId}");
             writer.WriteEndElement();
             
             writer.WriteEndElement(); // graphicData
@@ -1650,14 +1693,16 @@ namespace Nefdev.PptToPptx
             WriteRelationship(writer, "rId1", REL_SLIDE_LAYOUT, "../slideLayouts/slideLayout1.xml");
             
             // Charts
-            int chartRid = 2;
+            int chartRelId = 2;
             int imageRid = 100;
             foreach (var shape in slide.Shapes)
             {
                 if (shape.Type == "Chart" && shape.Chart != null)
                 {
-                    WriteRelationship(writer, $"rId{chartRid}", REL_CHART, $"../charts/chart{chartRid - 1}.xml");
-                    chartRid++;
+                    int partId = GetChartPartId(shape);
+                    if (partId <= 0) partId = chartRelId; // fallback
+                    WriteRelationship(writer, $"rId{chartRelId}", REL_CHART, $"../charts/chart{partId}.xml");
+                    chartRelId++;
                 }
                 else if (shape.Type == "Picture" && shape.ImageId != null)
                 {
@@ -1907,16 +1952,18 @@ namespace Nefdev.PptToPptx
                 WriteGroupShapeProperties(writer);
                 
                 int shapeId = 2;
-                int chartId = 1;
+                int chartRelId = 3; // rId1=layout, rId2=theme
                 int imageRid = 100;
                 
                 foreach (var shape in masterSlide.Shapes)
                 {
                     if (shape.Type == "Chart" && shape.Chart != null)
                     {
-                        WriteChartFrame(writer, shape, shapeId, chartId);
-                        WriteChartXml(baseDir, shape.Chart, chartId);
-                        chartId++;
+                        int partId = GetChartPartId(shape);
+                        if (partId <= 0) partId = chartRelId; // fallback
+                        WriteChartFrame(writer, shape, shapeId, chartRelId, partId);
+                        WriteChartXml(baseDir, shape.Chart, partId);
+                        chartRelId++;
                     }
                     else if (shape.Type == "Table" && shape.Table != null)
                     {
@@ -1992,14 +2039,16 @@ namespace Nefdev.PptToPptx
                 WriteRelationship(writer, "rId1", REL_SLIDE_LAYOUT, $"../slideLayouts/slideLayout{masterNum}.xml");
                 WriteRelationship(writer, "rId2", REL_THEME, "../theme/theme1.xml");
                 
-                int chartRid = 3;
+                int chartRelId = 3;
                 int imageRid = 100;
                 foreach (var shape in masterSlide.Shapes)
                 {
                     if (shape.Type == "Chart" && shape.Chart != null)
                     {
-                        WriteRelationship(writer, $"rId{chartRid}", REL_CHART, $"../charts/chart{chartRid - 1}.xml");
-                        chartRid++;
+                        int partId = GetChartPartId(shape);
+                        if (partId <= 0) partId = chartRelId; // fallback
+                        WriteRelationship(writer, $"rId{chartRelId}", REL_CHART, $"../charts/chart{partId}.xml");
+                        chartRelId++;
                     }
                     else if (shape.Type == "Picture" && shape.ImageId != null)
                     {
