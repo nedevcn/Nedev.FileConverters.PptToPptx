@@ -8,6 +8,7 @@ namespace Nefdev.PptToPptx
         public int SlideWidth { get; set; } = 9144000;   // EMU (10 inches)
         public int SlideHeight { get; set; } = 6858000;  // EMU (7.5 inches)
         public List<ImageResource> Images { get; set; } = new List<ImageResource>();
+        public List<EmbeddedResource> EmbeddedResources { get; set; } = new List<EmbeddedResource>();
         
         public Presentation()
         {
@@ -38,6 +39,17 @@ namespace Nefdev.PptToPptx
         public string Type { get; set; }  // "TextBox", "Rectangle", "Picture", "Chart", "Group", "Placeholder"
         public string Text { get; set; }
         public Chart Chart { get; set; }
+
+        // Placeholder / layout semantics (best-effort)
+        // Common values: "title", "body", "dt", "ftr", "sldNum"
+        public string PlaceholderType { get; set; }
+        public int? PlaceholderIndex { get; set; }
+
+        public int? EmbeddedResourceId { get; set; }
+
+        // Click actions (internal navigation etc.)
+        // Examples: "ppaction://hlinkshowjump?jump=nextslide"
+        public string ClickAction { get; set; }
         
         // 位置和大小 (EMU)
         public long Left { get; set; }
@@ -62,6 +74,18 @@ namespace Nefdev.PptToPptx
         
         // 线条颜色
         public string LineColor { get; set; }
+
+        // Line style
+        public long? LineWidth { get; set; } // in OOXML EMU
+        public string LineDash { get; set; } // "solid","dash","dot","dashDot","lgDash"...
+
+        // Fill style
+        public bool HasGradientFill { get; set; }
+        public string FillBackColor { get; set; }
+
+        // Shadow (very simplified)
+        public bool HasShadow { get; set; }
+        public string ShadowColor { get; set; }
         
         // 超链接
         public string Hyperlink { get; set; }
@@ -132,6 +156,18 @@ namespace Nefdev.PptToPptx
         
         // 超链接
         public string Hyperlink { get; set; }
+        public string ClickAction { get; set; }
+    }
+
+    public class EmbeddedResource
+    {
+        public int Id { get; set; }
+        public string Kind { get; set; } // "ole", "media", "unknown"
+        public string ProgId { get; set; }
+        public string FileName { get; set; }
+        public string Extension { get; set; }
+        public string ContentType { get; set; }
+        public byte[] Data { get; set; }
     }
     
     public enum TextAlignment

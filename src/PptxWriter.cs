@@ -59,6 +59,7 @@ namespace Nefdev.PptToPptx
                 
                 // 写入图片资源
                 WriteMediaFiles(tempDir, presentation);
+                WriteEmbeddingFiles(tempDir, presentation);
                 
                 WritePresentationXml(tempDir, presentation);
                 WritePresentationRelationships(tempDir, presentation);
@@ -115,6 +116,7 @@ namespace Nefdev.PptToPptx
             Directory.CreateDirectory(Path.Combine(baseDir, "ppt", "theme"));
             Directory.CreateDirectory(Path.Combine(baseDir, "ppt", "notesSlides"));
             Directory.CreateDirectory(Path.Combine(baseDir, "ppt", "notesSlides", "_rels"));
+            Directory.CreateDirectory(Path.Combine(baseDir, "ppt", "embeddings"));
         }
         
         #region Content Types
@@ -124,6 +126,7 @@ namespace Nefdev.PptToPptx
             bool hasVba = presentation?.VbaProject?.ProjectData != null;
             string extension = Path.GetExtension(_outputPath);
             bool isMacroEnabledPackage = hasVba && string.Equals(extension, ".pptm", StringComparison.OrdinalIgnoreCase);
+            bool hasEmbeddings = presentation?.EmbeddedResources != null && presentation.EmbeddedResources.Count > 0;
 
             var path = Path.Combine(baseDir, "[Content_Types].xml");
             using var writer = XmlWriter.Create(path, new XmlWriterSettings { Indent = true });
@@ -142,6 +145,16 @@ namespace Nefdev.PptToPptx
             DirectoryPropertyDefault(writer, "wmf", "image/x-wmf");
             DirectoryPropertyDefault(writer, "bmp", "image/bmp");
             DirectoryPropertyDefault(writer, "tiff", "image/tiff");
+
+            // Common media defaults (only needed when embedding media-like blobs)
+            if (hasEmbeddings)
+            {
+                WriteDefault(writer, "wav", "audio/wav");
+                WriteDefault(writer, "mp3", "audio/mpeg");
+                WriteDefault(writer, "mp4", "video/mp4");
+                WriteDefault(writer, "m4a", "audio/mp4");
+                WriteDefault(writer, "wma", "audio/x-ms-wma");
+            }
             
             // Override — presentation (macro-enabled 与普通包类型区分)
             var presentationContentType = isMacroEnabledPackage
@@ -183,6 +196,15 @@ namespace Nefdev.PptToPptx
             if (hasVba)
             {
                 WriteOverride(writer, "/ppt/vba/vbaProject.bin", "application/vnd.ms-office.vbaProject");
+            }
+
+            // OLE embeddings (we currently store all embedded resources as oleObjectN.bin)
+            if (hasEmbeddings)
+            {
+                for (int i = 0; i < presentation.EmbeddedResources.Count; i++)
+                {
+                    WriteOverride(writer, $"/ppt/embeddings/oleObject{i + 1}.bin", "application/vnd.openxmlformats-officedocument.oleObject");
+                }
             }
             
             writer.WriteEndElement();
@@ -467,6 +489,7 @@ namespace Nefdev.PptToPptx
             writer.WriteStartElement("p", "childTnLst", NS_P);
             
             int tnId = 3;
+            int nonClickIndex = 0;
             foreach (var shape in animatedShapes)
             {
                 int shapeId = slide.Shapes.IndexOf(shape) + 2; // Match shapeId in WriteSlideXml
@@ -476,7 +499,18 @@ namespace Nefdev.PptToPptx
                 writer.WriteStartElement("p", "cTn", NS_P);
                 writer.WriteAttributeString("id", (tnId++).ToString());
                 writer.WriteAttributeString("fill", "hold");
-                writer.WriteAttributeString("nodeType", anim.TriggerOnClick ? "clickEffect" : "withPrevious");
+                // If it's not click-triggered, make them sequential after the first
+                string nodeType;
+                if (anim.TriggerOnClick)
+                {
+                    nodeType = "clickEffect";
+                }
+                else
+                {
+                    nodeType = nonClickIndex == 0 ? "withPrevious" : "afterEffect";
+                    nonClickIndex++;
+                }
+                writer.WriteAttributeString("nodeType", nodeType);
                 
                 writer.WriteStartElement("p", "stCondLst", NS_P);
                 writer.WriteStartElement("p", "cond", NS_P);
@@ -486,10 +520,10 @@ namespace Nefdev.PptToPptx
 
                 writer.WriteStartElement("p", "childTnLst", NS_P);
                 
-                // Entrance Effect
-                writer.WriteStartElement("p", "anim", NS_P);
-                writer.WriteAttributeString("calcmode", "lin");
-                writer.WriteAttributeString("valueType", "num");
+                // Entrance Effect (best-effort): use animEffect with filter
+                writer.WriteStartElement("p", "animEffect", NS_P);
+                writer.WriteAttributeString("transition", "in");
+                writer.WriteAttributeString("filter", anim.Type ?? "fade");
                 
                 writer.WriteStartElement("p", "cTn", NS_P);
                 writer.WriteAttributeString("id", (tnId++).ToString());
@@ -504,7 +538,7 @@ namespace Nefdev.PptToPptx
                 writer.WriteEndElement();
 
                 writer.WriteEndElement(); // cTn
-                writer.WriteEndElement(); // anim
+                writer.WriteEndElement(); // animEffect
 
                 writer.WriteEndElement(); // childTnLst
                 writer.WriteEndElement(); // cTn
@@ -615,7 +649,13 @@ namespace Nefdev.PptToPptx
             writer.WriteAttributeString("id", shapeId.ToString());
             writer.WriteAttributeString("name", $"TextBox {shapeId}");
             
-            if (!string.IsNullOrEmpty(shape.Hyperlink))
+            if (!string.IsNullOrEmpty(shape.ClickAction))
+            {
+                writer.WriteStartElement("a", "hlinkClick", NS_A);
+                writer.WriteAttributeString("action", shape.ClickAction);
+                writer.WriteEndElement();
+            }
+            else if (!string.IsNullOrEmpty(shape.Hyperlink))
             {
                 int hId = 1000 + (slideNum * 100) + shapeIndex;
                 writer.WriteStartElement("a", "hlinkClick", NS_A);
@@ -630,6 +670,13 @@ namespace Nefdev.PptToPptx
             writer.WriteEndElement();
             
             writer.WriteStartElement("p", "nvPr", NS_P);
+            if (!string.IsNullOrEmpty(shape.PlaceholderType))
+            {
+                writer.WriteStartElement("p", "ph", NS_P);
+                writer.WriteAttributeString("type", shape.PlaceholderType);
+                writer.WriteAttributeString("idx", (shape.PlaceholderIndex ?? 0).ToString());
+                writer.WriteEndElement();
+            }
             writer.WriteEndElement();
             
             writer.WriteEndElement(); // nvSpPr
@@ -663,7 +710,32 @@ namespace Nefdev.PptToPptx
             }
             
             // 填充颜色
-            if (!string.IsNullOrEmpty(shape.FillColor))
+            if (!string.IsNullOrEmpty(shape.FillColor) && shape.HasGradientFill)
+            {
+                // Simple 2-stop gradient
+                writer.WriteStartElement("a", "gradFill", NS_A);
+                writer.WriteAttributeString("rotWithShape", "1");
+                writer.WriteStartElement("a", "gsLst", NS_A);
+                writer.WriteStartElement("a", "gs", NS_A);
+                writer.WriteAttributeString("pos", "0");
+                writer.WriteStartElement("a", "srgbClr", NS_A);
+                writer.WriteAttributeString("val", shape.FillColor);
+                writer.WriteEndElement();
+                writer.WriteEndElement();
+                writer.WriteStartElement("a", "gs", NS_A);
+                writer.WriteAttributeString("pos", "100000");
+                writer.WriteStartElement("a", "srgbClr", NS_A);
+                writer.WriteAttributeString("val", string.IsNullOrEmpty(shape.FillBackColor) ? "FFFFFF" : shape.FillBackColor);
+                writer.WriteEndElement();
+                writer.WriteEndElement();
+                writer.WriteEndElement(); // gsLst
+                writer.WriteStartElement("a", "lin", NS_A);
+                writer.WriteAttributeString("ang", "5400000");
+                writer.WriteAttributeString("scaled", "0");
+                writer.WriteEndElement();
+                writer.WriteEndElement(); // gradFill
+            }
+            else if (!string.IsNullOrEmpty(shape.FillColor))
             {
                 writer.WriteStartElement("a", "solidFill", NS_A);
                 writer.WriteStartElement("a", "srgbClr", NS_A);
@@ -681,12 +753,36 @@ namespace Nefdev.PptToPptx
             if (!string.IsNullOrEmpty(shape.LineColor))
             {
                 writer.WriteStartElement("a", "ln", NS_A);
+                if (shape.LineWidth.HasValue && shape.LineWidth.Value > 0)
+                {
+                    writer.WriteAttributeString("w", shape.LineWidth.Value.ToString());
+                }
                 writer.WriteStartElement("a", "solidFill", NS_A);
                 writer.WriteStartElement("a", "srgbClr", NS_A);
                 writer.WriteAttributeString("val", shape.LineColor);
                 writer.WriteEndElement();
                 writer.WriteEndElement();
+                if (!string.IsNullOrEmpty(shape.LineDash) && shape.LineDash != "solid")
+                {
+                    writer.WriteStartElement("a", "prstDash", NS_A);
+                    writer.WriteAttributeString("val", shape.LineDash);
+                    writer.WriteEndElement();
+                }
                 writer.WriteEndElement();
+            }
+
+            // Shadow (very simplified)
+            if (shape.HasShadow && !string.IsNullOrEmpty(shape.ShadowColor))
+            {
+                writer.WriteStartElement("a", "effectLst", NS_A);
+                writer.WriteStartElement("a", "outerShd", NS_A);
+                writer.WriteAttributeString("dist", "38100"); // ~3pt
+                writer.WriteAttributeString("dir", "5400000"); // 90deg
+                writer.WriteStartElement("a", "srgbClr", NS_A);
+                writer.WriteAttributeString("val", shape.ShadowColor);
+                writer.WriteEndElement();
+                writer.WriteEndElement(); // outerShd
+                writer.WriteEndElement(); // effectLst
             }
             
             writer.WriteEndElement(); // spPr
@@ -951,7 +1047,13 @@ namespace Nefdev.PptToPptx
             writer.WriteAttributeString("id", shapeId.ToString());
             writer.WriteAttributeString("name", $"Picture {shapeId}");
             
-            if (!string.IsNullOrEmpty(shape.Hyperlink))
+            if (!string.IsNullOrEmpty(shape.ClickAction))
+            {
+                writer.WriteStartElement("a", "hlinkClick", NS_A);
+                writer.WriteAttributeString("action", shape.ClickAction);
+                writer.WriteEndElement();
+            }
+            else if (!string.IsNullOrEmpty(shape.Hyperlink))
             {
                 int hId = 1000 + (slideNum * 100) + shapeIndex;
                 writer.WriteStartElement("a", "hlinkClick", NS_A);
@@ -963,6 +1065,13 @@ namespace Nefdev.PptToPptx
             writer.WriteStartElement("p", "cNvPicPr", NS_P);
             writer.WriteEndElement();
             writer.WriteStartElement("p", "nvPr", NS_P);
+            if (!string.IsNullOrEmpty(shape.PlaceholderType))
+            {
+                writer.WriteStartElement("p", "ph", NS_P);
+                writer.WriteAttributeString("type", shape.PlaceholderType);
+                writer.WriteAttributeString("idx", (shape.PlaceholderIndex ?? 0).ToString());
+                writer.WriteEndElement();
+            }
             writer.WriteEndElement();
             writer.WriteEndElement(); // nvPicPr
 
@@ -1115,8 +1224,14 @@ namespace Nefdev.PptToPptx
                     writer.WriteEndElement();
                 }
                 
-                // Hyperlink
-                if (!string.IsNullOrEmpty(run.Hyperlink))
+                // Hyperlink / Action
+                if (!string.IsNullOrEmpty(run.ClickAction))
+                {
+                    writer.WriteStartElement("a", "hlinkClick", NS_A);
+                    writer.WriteAttributeString("action", run.ClickAction);
+                    writer.WriteEndElement();
+                }
+                else if (!string.IsNullOrEmpty(run.Hyperlink))
                 {
                     int hId = 2000 + (slideNum * 1000) + (shapeIndex * 50) + runIndexOffset + i;
                     writer.WriteStartElement("a", "hlinkClick", NS_A);
@@ -1683,18 +1798,76 @@ namespace Nefdev.PptToPptx
                 writer.WriteStartElement("p", "sldLayout", NS_P);
                 writer.WriteAttributeString("xmlns", "a", null, NS_A);
                 writer.WriteAttributeString("xmlns", "r", null, NS_R);
-                writer.WriteAttributeString("type", "blank");
+                writer.WriteAttributeString("type", "titleAndObj");
                 writer.WriteAttributeString("preserve", "1");
                 
                 writer.WriteStartElement("p", "cSld", NS_P);
                 writer.WriteStartElement("p", "spTree", NS_P);
                 WriteGroupShapeProperties(writer);
+
+                // Title placeholder
+                WritePlaceholderShape(writer, 2, "Title", "title", 0, 457200, 228600, presentation.SlideWidth - 914400, 914400);
+                // Body placeholder (content)
+                WritePlaceholderShape(writer, 3, "Content Placeholder", "body", 1, 685800, 1371600, presentation.SlideWidth - 1371600, presentation.SlideHeight - 2057400);
+
                 writer.WriteEndElement(); // spTree
                 writer.WriteEndElement(); // cSld
                 
                 writer.WriteEndElement(); // sldLayout
                 writer.WriteEndDocument();
             }
+        }
+
+        private void WritePlaceholderShape(XmlWriter writer, int shapeId, string name, string phType, int idx, long x, long y, long cx, long cy)
+        {
+            writer.WriteStartElement("p", "sp", NS_P);
+
+            writer.WriteStartElement("p", "nvSpPr", NS_P);
+            writer.WriteStartElement("p", "cNvPr", NS_P);
+            writer.WriteAttributeString("id", shapeId.ToString());
+            writer.WriteAttributeString("name", name);
+            writer.WriteEndElement(); // cNvPr
+
+            writer.WriteStartElement("p", "cNvSpPr", NS_P);
+            writer.WriteEndElement();
+
+            writer.WriteStartElement("p", "nvPr", NS_P);
+            writer.WriteStartElement("p", "ph", NS_P);
+            writer.WriteAttributeString("type", phType);
+            writer.WriteAttributeString("idx", idx.ToString());
+            writer.WriteEndElement(); // ph
+            writer.WriteEndElement(); // nvPr
+
+            writer.WriteEndElement(); // nvSpPr
+
+            writer.WriteStartElement("p", "spPr", NS_P);
+            writer.WriteStartElement("a", "xfrm", NS_A);
+            writer.WriteStartElement("a", "off", NS_A);
+            writer.WriteAttributeString("x", x.ToString());
+            writer.WriteAttributeString("y", y.ToString());
+            writer.WriteEndElement();
+            writer.WriteStartElement("a", "ext", NS_A);
+            writer.WriteAttributeString("cx", Math.Max(0, cx).ToString());
+            writer.WriteAttributeString("cy", Math.Max(0, cy).ToString());
+            writer.WriteEndElement();
+            writer.WriteEndElement(); // xfrm
+            writer.WriteStartElement("a", "prstGeom", NS_A);
+            writer.WriteAttributeString("prst", "rect");
+            writer.WriteStartElement("a", "avLst", NS_A);
+            writer.WriteEndElement();
+            writer.WriteEndElement(); // prstGeom
+            writer.WriteEndElement(); // spPr
+
+            writer.WriteStartElement("p", "txBody", NS_P);
+            writer.WriteStartElement("a", "bodyPr", NS_A);
+            writer.WriteEndElement();
+            writer.WriteStartElement("a", "lstStyle", NS_A);
+            writer.WriteEndElement();
+            writer.WriteStartElement("a", "p", NS_A);
+            writer.WriteEndElement();
+            writer.WriteEndElement(); // txBody
+
+            writer.WriteEndElement(); // sp
         }
         
         private void WriteSlideLayoutRelationships(string baseDir, Presentation presentation)
@@ -1766,6 +1939,14 @@ namespace Nefdev.PptToPptx
                 
                 writer.WriteEndElement(); // spTree
                 writer.WriteEndElement(); // cSld
+
+                // Header/Footer flags (enable placeholders presence)
+                writer.WriteStartElement("p", "hf", NS_P);
+                writer.WriteAttributeString("dt", "1");
+                writer.WriteAttributeString("ftr", "1");
+                writer.WriteAttributeString("sldNum", "1");
+                writer.WriteAttributeString("hdr", "0");
+                writer.WriteEndElement(); // hf
                 
                 // clrMap (required by schema before sldLayoutIdLst)
                 writer.WriteStartElement("p", "clrMap", NS_P);
@@ -2148,6 +2329,23 @@ namespace Nefdev.PptToPptx
                 string ext = img.Extension ?? "png";
                 string path = Path.Combine(mediaDir, $"image{img.Id}.{ext}");
                 File.WriteAllBytes(path, img.Data);
+            }
+        }
+
+        private void WriteEmbeddingFiles(string baseDir, Presentation presentation)
+        {
+            if (presentation?.EmbeddedResources == null || presentation.EmbeddedResources.Count == 0) return;
+
+            var embedDir = Path.Combine(baseDir, "ppt", "embeddings");
+            Directory.CreateDirectory(embedDir);
+
+            for (int i = 0; i < presentation.EmbeddedResources.Count; i++)
+            {
+                var res = presentation.EmbeddedResources[i];
+                if (res == null || res.Data == null || res.Data.Length == 0) continue;
+                // Store as OLE-like binary for extraction (matches ContentTypes overrides)
+                string path = Path.Combine(embedDir, $"oleObject{i + 1}.bin");
+                File.WriteAllBytes(path, res.Data);
             }
         }
         

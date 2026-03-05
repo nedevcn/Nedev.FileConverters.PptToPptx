@@ -13,8 +13,14 @@ namespace Nefdev.PptToPptx
         private byte[] _picturesData;
         private OleCompoundFile _oleFile;
         
-        // exObjId → OLE storage name (e.g., "_1326458456")
-        private Dictionary<int, string> _exOleObjMap = new Dictionary<int, string>();
+        private struct OleObjectInfo
+        {
+            public string StorageName;
+            public string ProgId;
+        }
+
+        // exObjId → OLE storage name / progId (e.g., "_1326458456")
+        private Dictionary<int, OleObjectInfo> _exOleObjMap = new Dictionary<int, OleObjectInfo>();
         
         // PPT Record type constants
         private const ushort RT_Document = 1000;
@@ -176,8 +182,102 @@ namespace Nefdev.PptToPptx
             // 读取 VBA 项目
             presentation.VbaProject = ReadVbaProject(oleFile);
 
+            // Post-process: attach embedded resources (from OleObject shapes) and mark footer placeholders
+            AttachEmbeddedResources(presentation);
+            DetectFooterPlaceholders(presentation);
+
             Console.WriteLine($"ReadPresentation complete. Total slides: {presentation.Slides.Count}, Total images: {presentation.Images.Count}");
             return presentation;
+        }
+
+        private void AttachEmbeddedResources(Presentation presentation)
+        {
+            if (presentation == null) return;
+            int nextId = presentation.EmbeddedResources.Count + 1;
+
+            IEnumerable<Slide> allSlides = presentation.Slides.Concat(presentation.Masters);
+            foreach (var slide in allSlides)
+            {
+                foreach (var shape in slide.Shapes)
+                {
+                    if (shape.Type == "OleObject" && shape.ImageData != null && shape.ImageData.Length > 0)
+                    {
+                        var res = new EmbeddedResource
+                        {
+                            Id = nextId++,
+                            Kind = (shape.ImageContentType != null && (shape.ImageContentType.StartsWith("audio/") || shape.ImageContentType.StartsWith("video/"))) ? "media" : "ole",
+                            ProgId = null,
+                            FileName = $"object{nextId - 1}",
+                            Extension = GuessExtFromContentType(shape.ImageContentType),
+                            ContentType = shape.ImageContentType,
+                            Data = shape.ImageData
+                        };
+                        presentation.EmbeddedResources.Add(res);
+
+                        shape.EmbeddedResourceId = res.Id;
+
+                        // Clear temporary stash fields to avoid bloating other code paths
+                        shape.ImageData = null;
+                        shape.ImageContentType = null;
+                    }
+                }
+            }
+        }
+
+        private string GuessExtFromContentType(string contentType)
+        {
+            if (string.IsNullOrEmpty(contentType)) return "bin";
+            return contentType switch
+            {
+                "audio/wav" => "wav",
+                "audio/mpeg" => "mp3",
+                "video/mp4" => "mp4",
+                "application/vnd.openxmlformats-officedocument.oleObject" => "bin",
+                _ => "bin"
+            };
+        }
+
+        private void DetectFooterPlaceholders(Presentation presentation)
+        {
+            if (presentation == null) return;
+            long h = presentation.SlideHeight > 0 ? presentation.SlideHeight : 6858000;
+            long footerBandTop = h - 600000; // ~0.66 inch from bottom
+
+            foreach (var slide in presentation.Slides)
+            {
+                foreach (var shape in slide.Shapes)
+                {
+                    if (shape.Type != "TextBox" && shape.Type != "Rectangle") continue;
+                    if (shape.Top < footerBandTop) continue;
+
+                    string txt = shape.Text ?? string.Join("", shape.Paragraphs.ConvertAll(p => p.GetPlainText()));
+                    txt = txt?.Trim();
+                    if (string.IsNullOrEmpty(txt)) continue;
+
+                    // Slide number: small numeric token
+                    if (txt.Length <= 4 && int.TryParse(txt, out _))
+                    {
+                        shape.PlaceholderType = "sldNum";
+                        shape.Type = "Placeholder";
+                        continue;
+                    }
+                    // Date-ish: contains '/', '-' and digits
+                    bool hasDigit = txt.Any(char.IsDigit);
+                    bool hasSep = txt.Contains('/') || txt.Contains('-') || txt.Contains('.');
+                    if (hasDigit && hasSep && txt.Length <= 20)
+                    {
+                        shape.PlaceholderType = "dt";
+                        shape.Type = "Placeholder";
+                        continue;
+                    }
+                    // Otherwise treat as footer text
+                    if (txt.Length <= 80)
+                    {
+                        shape.PlaceholderType = "ftr";
+                        shape.Type = "Placeholder";
+                    }
+                }
+            }
         }
 
         private int ReadCurrentUser(Stream stream)
@@ -487,7 +587,7 @@ namespace Nefdev.PptToPptx
             
             if (exObjId.HasValue && storageName != null)
             {
-                _exOleObjMap[exObjId.Value] = storageName;
+                _exOleObjMap[exObjId.Value] = new OleObjectInfo { StorageName = storageName, ProgId = progId };
                 Console.WriteLine($"OLE ExObj mapping: exObjId={exObjId.Value} -> storage='{storageName}' progId='{progId}'");
             }
         }
@@ -548,14 +648,48 @@ namespace Nefdev.PptToPptx
 
                 if (header.RecType == RT_InteractiveInfoAtom)
                 {
-                    if (header.RecLen >= 8)
+                    if (header.RecLen >= 13)
                     {
-                        // Byte 4-7 is hyperlink ID
+                        // Layout per Apache POI / MS-PPT:
+                        // 0..3 soundRef, 4..7 hyperlinkId, 8 action, 9 oleVerb, 10 jump, 11 flags, 12 hyperlinkType
                         int hyperlinkId = BitConverter.ToInt32(data, atomStart + 4);
-                        if (_hyperlinkMap.TryGetValue(hyperlinkId, out string url))
+                        byte action = data[atomStart + 8];
+                        byte jump = data[atomStart + 10];
+                        byte hyperlinkType = data[atomStart + 12];
+
+                        // External hyperlink address (if exists)
+                        if (_hyperlinkMap.TryGetValue(hyperlinkId, out string url) && !string.IsNullOrEmpty(url))
                         {
                             shape.Hyperlink = url;
                             Console.WriteLine($"Associated hyperlink {hyperlinkId} ({url}) with shape");
+                        }
+
+                        // Internal jump / action mapping (best-effort)
+                        // action: 3=JUMP, 4=HYPERLINK
+                        if (action == 3) // ACTION_JUMP
+                        {
+                            shape.ClickAction = jump switch
+                            {
+                                1 => "ppaction://hlinkshowjump?jump=nextslide",
+                                2 => "ppaction://hlinkshowjump?jump=previousslide",
+                                3 => "ppaction://hlinkshowjump?jump=firstslide",
+                                4 => "ppaction://hlinkshowjump?jump=lastslide",
+                                5 => "ppaction://hlinkshowjump?jump=lastslideviewed",
+                                6 => "ppaction://hlinkshowjump?jump=endshow",
+                                _ => shape.ClickAction
+                            };
+                        }
+                        else if (action == 4 && shape.Hyperlink == null) // ACTION_HYPERLINK but no URL decoded
+                        {
+                            // Try to map by hyperlink type if possible
+                            shape.ClickAction = hyperlinkType switch
+                            {
+                                0x00 => "ppaction://hlinkshowjump?jump=nextslide",
+                                0x01 => "ppaction://hlinkshowjump?jump=previousslide",
+                                0x02 => "ppaction://hlinkshowjump?jump=firstslide",
+                                0x03 => "ppaction://hlinkshowjump?jump=lastslide",
+                                _ => shape.ClickAction
+                            };
                         }
                     }
                 }
@@ -665,9 +799,9 @@ namespace Nefdev.PptToPptx
             if (_oleFile == null) return null;
 
             string storageName = null;
-            if (_exOleObjMap.TryGetValue(exObjId, out string name))
+            if (_exOleObjMap.TryGetValue(exObjId, out OleObjectInfo info))
             {
-                storageName = name;
+                storageName = info.StorageName;
             }
             else
             {
@@ -714,6 +848,135 @@ namespace Nefdev.PptToPptx
                 }
             }
             
+            return null;
+        }
+
+        private EmbeddedResource TryExtractEmbeddedResourceFromExObjId(int exObjId)
+        {
+            if (_oleFile == null) return null;
+
+            if (!_exOleObjMap.TryGetValue(exObjId, out OleObjectInfo info) || string.IsNullOrEmpty(info.StorageName))
+                return null;
+
+            // Prefer common payload stream names for embedded packages/media
+            string[] candidateNames = new[] { "CONTENTS", "Contents", "\u0001Ole10Native", "Package", "Data", "Media", "CONTENTS1" };
+            OleCompoundFile.DirectoryEntry bestEntry = null;
+            foreach (var name in candidateNames)
+            {
+                var entry = GetChildStreamEntry(info.StorageName, name);
+                if (entry != null && entry.Size > 0)
+                {
+                    bestEntry = entry;
+                    break;
+                }
+            }
+
+            // Fallback: pick the largest child stream (excluding Workbook/Book which are chart data)
+            if (bestEntry == null)
+            {
+                var entries = GetChildStreamEntries(info.StorageName);
+                foreach (var e in entries)
+                {
+                    if (e.Type != OleCompoundFile.DirectoryEntryType.UserStream) continue;
+                    if (string.Equals(e.Name, "Workbook", StringComparison.OrdinalIgnoreCase)) continue;
+                    if (string.Equals(e.Name, "Book", StringComparison.OrdinalIgnoreCase)) continue;
+                    if (bestEntry == null || e.Size > bestEntry.Size) bestEntry = e;
+                }
+            }
+
+            if (bestEntry == null) return null;
+
+            using var stream = _oleFile.GetStream(bestEntry);
+            if (stream == null) return null;
+            byte[] payload = ReadAllBytes(stream);
+            if (payload == null || payload.Length == 0) return null;
+
+            var res = new EmbeddedResource();
+            res.Kind = GuessKindFromProgId(info.ProgId);
+            res.ProgId = info.ProgId;
+            res.FileName = $"{info.StorageName}_{bestEntry.Name}";
+            GuessExtensionAndContentType(payload, out string ext, out string ct);
+            res.Extension = ext;
+            res.ContentType = ct;
+            res.Data = payload;
+            return res;
+        }
+
+        private string GuessKindFromProgId(string progId)
+        {
+            if (string.IsNullOrEmpty(progId)) return "unknown";
+            string p = progId.ToLowerInvariant();
+            if (p.Contains("sound") || p.Contains("media") || p.Contains("video") || p.Contains("wmplayer"))
+                return "media";
+            return "ole";
+        }
+
+        private void GuessExtensionAndContentType(byte[] payload, out string extension, out string contentType)
+        {
+            extension = "bin";
+            contentType = "application/octet-stream";
+            if (payload.Length >= 12)
+            {
+                // RIFF....WAVE
+                if (payload[0] == (byte)'R' && payload[1] == (byte)'I' && payload[2] == (byte)'F' && payload[3] == (byte)'F'
+                    && payload[8] == (byte)'W' && payload[9] == (byte)'A' && payload[10] == (byte)'V' && payload[11] == (byte)'E')
+                {
+                    extension = "wav";
+                    contentType = "audio/wav";
+                    return;
+                }
+                // ID3 (mp3)
+                if (payload[0] == (byte)'I' && payload[1] == (byte)'D' && payload[2] == (byte)'3')
+                {
+                    extension = "mp3";
+                    contentType = "audio/mpeg";
+                    return;
+                }
+                // MP4 ftyp
+                if (payload[4] == (byte)'f' && payload[5] == (byte)'t' && payload[6] == (byte)'y' && payload[7] == (byte)'p')
+                {
+                    extension = "mp4";
+                    contentType = "video/mp4";
+                    return;
+                }
+                // OLE Compound File header
+                if (payload[0] == 0xD0 && payload[1] == 0xCF && payload[2] == 0x11 && payload[3] == 0xE0)
+                {
+                    extension = "bin";
+                    contentType = "application/vnd.openxmlformats-officedocument.oleObject";
+                    return;
+                }
+            }
+        }
+
+        private List<OleCompoundFile.DirectoryEntry> GetChildStreamEntries(string storageName)
+        {
+            var result = new List<OleCompoundFile.DirectoryEntry>();
+            if (_oleFile == null) return result;
+            bool inStorage = false;
+            foreach (var entry in _oleFile.DirectoryList)
+            {
+                if (entry.Name == storageName && entry.Type == OleCompoundFile.DirectoryEntryType.UserStorage)
+                {
+                    inStorage = true;
+                    continue;
+                }
+                if (inStorage)
+                {
+                    if (entry.Type == OleCompoundFile.DirectoryEntryType.UserStorage || entry.Type == OleCompoundFile.DirectoryEntryType.RootStorage)
+                        break;
+                    result.Add(entry);
+                }
+            }
+            return result;
+        }
+
+        private OleCompoundFile.DirectoryEntry GetChildStreamEntry(string storageName, string streamName)
+        {
+            foreach (var e in GetChildStreamEntries(storageName))
+            {
+                if (e.Type == OleCompoundFile.DirectoryEntryType.UserStream && e.Name == streamName) return e;
+            }
             return null;
         }
 
@@ -1373,6 +1636,19 @@ namespace Nefdev.PptToPptx
                                 shape.Chart = chart;
                                 Console.WriteLine($"Parsed chart from exObjId={exObjId}: {chart.Series.Count} series");
                             }
+                            else
+                            {
+                                var emb = TryExtractEmbeddedResourceFromExObjId(exObjId);
+                                if (emb != null)
+                                {
+                                    // Assign an ID later in a post-pass; store on shape for now via placeholder fields
+                                    shape.Type = "OleObject";
+                                    shape.Text = shape.Text ?? $"[Embedded object] {emb.ProgId ?? ""}".Trim();
+                                    // Temporarily stash in ImageData fields to avoid further model changes here
+                                    shape.ImageData = emb.Data;
+                                    shape.ImageContentType = emb.ContentType;
+                                }
+                            }
                         }
                         
                         // Check for Programmable Tags (Table detection)
@@ -1871,8 +2147,38 @@ namespace Nefdev.PptToPptx
                     byte lr = (byte)((propValue >> 16) & 0xFF);
                     shape.LineColor = $"{lr:X2}{lg:X2}{lb:X2}";
                     break;
+                case 0x01CB: // lineWidth
+                    shape.LineWidth = propValue;
+                    break;
+                case 0x01CE: // lineDashing (very rough)
+                    shape.LineDash = propValue switch
+                    {
+                        0 => "solid",
+                        1 => "dot",
+                        2 => "dash",
+                        3 => "dashDot",
+                        4 => "lgDash",
+                        _ => "solid"
+                    };
+                    break;
                 case 0x01C3: // fNoLine
                     if ((propValue & 0x08) == 0) shape.LineColor = null;
+                    break;
+                case 0x0180: // fillType (rough: non-zero -> treat as gradient)
+                    shape.HasGradientFill = propValue != 0;
+                    break;
+                case 0x0182: // fillBackColor
+                    byte bb = (byte)(propValue & 0xFF);
+                    byte bg = (byte)((propValue >> 8) & 0xFF);
+                    byte br = (byte)((propValue >> 16) & 0xFF);
+                    shape.FillBackColor = $"{br:X2}{bg:X2}{bb:X2}";
+                    break;
+                case 0x0201: // shadowColor (best-effort)
+                    byte sb = (byte)(propValue & 0xFF);
+                    byte sg = (byte)((propValue >> 8) & 0xFF);
+                    byte sr = (byte)((propValue >> 16) & 0xFF);
+                    shape.ShadowColor = $"{sr:X2}{sg:X2}{sb:X2}";
+                    shape.HasShadow = true;
                     break;
                 case 0x0081: // dyTextTop
                     shape.MarginTop = (long)propValue;
