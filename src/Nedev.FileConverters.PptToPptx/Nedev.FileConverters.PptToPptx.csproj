@@ -16,7 +16,7 @@
     <Title>Nedev FileConverters PPT to PPTX</Title>
     <Description>Library for converting legacy `.ppt` files to modern `.pptx`/`.pptm` formats.</Description>
     <Authors>Nedev</Authors>
-    <PackageVersion>1.0.0</PackageVersion>
+    <PackageVersion>0.1.0</PackageVersion>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
     <PackageReadmeFile>README.md</PackageReadmeFile>
     <RepositoryUrl>https://github.com/yourorg/Nedev.FileConverters.PptToPptx</RepositoryUrl>
