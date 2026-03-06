@@ -1,6 +1,13 @@
-# NPptToPptx (Nedev.PptToPptx)
+# Nedev.FileConverters.PptToPptx
 
-NPptToPptx is a fast, lightweight, and standalone .NET library for converting legacy binary PowerPoint presentations (`.ppt`, PPT97-2003 format) into the modern OpenXML format (`.pptx`).
+A library and command-line tool for converting legacy PowerPoint `.ppt` files to modern OpenXML `.pptx` (or `.pptm`) format.
+
+NPptToPptx is a fast, lightweight .NET **library** for converting legacy binary PowerPoint presentations (`.ppt`, PPT97-2003 format) into the modern OpenXML format (`.pptx`).
+
+The repository contains two separate projects:
+
+* `Nedev.FileConverters.PptToPptx` – the core library (multi-targeted).
+* `Nedev.FileConverters.PptToPptx.Cli` – a small console application that wraps the library and is published as a global tool.
 
 Unlike many other solutions, this project works by directly parsing the underlying OLE Compound File streams and binary records (such as BIFF records for charts and ESCHER records for drawings), eliminating the need for Office Interop or heavy third-party dependencies.
 
@@ -69,24 +76,29 @@ The codebase is primarily divided into two main processing layers:
 
 ## How to Build & Run
 
-Ensure you have the .NET SDK installed (currently targets standard .NET platforms).
+Ensure you have the .NET SDK (8.0+) installed.
 
 ```bash
 # Clone the repository
 git clone <repository_url>
-cd NPptToPptx
+cd Nedev.FileConverters.PptToPptx
 
-# Build the project
-cd src
-dotnet build
+# Build the library (multi-targets)
+dotnet build src/Nedev.FileConverters.PptToPptx
+
+# Build the CLI tool separately
+dotnet build src/Nedev.FileConverters.PptToPptx.Cli
 ```
+
+After building the CLI project you can run the executable under `src/Nedev.FileConverters.PptToPptx.Cli/bin/Debug/net8.0` or install it as a tool.
 
 ## Usage
 
 Using the converter in your .NET code is straightforward. Simply call the `Convert` method on the `PptToPptxConverter` class, providing the input `.ppt` file path and the desired output `.pptx` file path.
 
 ```csharp
-using Nefdev.PptToPptx;
+using Nedev.FileConverters.PptToPptx;
+using Nedev.FileConverters.Core;
 
 class Program
 {
@@ -95,8 +107,11 @@ class Program
         string inputPpt = @"C:\path\to\legacy\presentation.ppt";
         string outputPptx = @"C:\path\to\output\presentation.pptx";
 
+        // configure options from the shared core library
+        var opts = new ConversionOptions { KeepTempFiles = true };
+
         // Convert the PPT to PPTX
-        PptToPptxConverter.Convert(inputPpt, outputPptx);
+        PptToPptxConverter.Convert(inputPpt, outputPptx, opts);
         
         System.Console.WriteLine("Conversion complete!");
     }
@@ -111,10 +126,59 @@ If the source `.ppt` contains a VBA project, you should write to a `.pptm` path 
 PptToPptxConverter.Convert(@"C:\in\legacy.ppt", @"C:\out\converted.pptm");
 ```
 
+## Command-line tool
+
+A standalone CLI project lives in `src/Nedev.FileConverters.PptToPptx.Cli`.  Build and run it separately (this project also references the core package for the registry API):
+
+```bash
+cd src/Nedev.FileConverters.PptToPptx.Cli
+dotnet run -- in.ppt out.pptx
+```
+
+Or install the tool after packing:
+
+```bash
+dotnet tool install --global Nedev.FileConverters.PptToPptx.Cli --version 1.0.0
+ppt2pptx in.ppt out.pptx
+```
+
 ## Requirements
 
 *   **.NET SDK:** .NET 8 (current project target)
 *   **No external Office installation required.**
+
+## Dependencies
+
+This converter depends on a shared core library available as the NuGet package **Nedev.FileConverters.Core** (version `0.1.0` or later).  The package provides a lightweight framework for registering and discovering file‑format converters.  Our library integrates by providing an `IFileConverter` adapter annotated with `[FileConverter("ppt","pptx")]`, so consumers who reference the core package can use the generic `Nedev.FileConverters.Converter` API or the DI helpers without additional code.  (Conversion options and encoding helpers remain defined locally to avoid a hard dependency on new package versions.)
+
+## NuGet Package
+
+The library project produces a NuGet package when built (`<GeneratePackageOnBuild>` is enabled).
+The package ID is **Nedev.FileConverters.PptToPptx** and includes the README as the package readme; the licence is MIT.
+
+To create the library package manually:
+
+```bash
+cd src/Nedev.FileConverters.PptToPptx
+dotnet pack -c Release
+```
+
+Install it locally or publish to NuGet.org as usual.
+
+The CLI project also packs itself and is intended to be deployed as a .NET global tool. Build or pack it independently:
+
+```bash
+cd src/Nedev.FileConverters.PptToPptx.Cli
+dotnet pack -c Release    # produces Nedev.FileConverters.PptToPptx.Cli.1.0.0.nupkg
+```
+
+Then install the tool:
+
+```bash
+dotnet tool install --global Nedev.FileConverters.PptToPptx.Cli --version 1.0.0
+ppt2pptx in.ppt out.pptx
+```
+
 
 ## Known Limitations / Roadmap
 
@@ -137,4 +201,4 @@ Contributions are welcome! If you find a bug (e.g., a specific `.ppt` file fails
 5. Open a Pull Request.
 
 ## License
-MIT License (or your chosen associated license)
+This project is licensed under the [MIT License](LICENSE).

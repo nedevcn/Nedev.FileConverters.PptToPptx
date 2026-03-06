@@ -4,7 +4,7 @@ using System.IO.Compression;
 using System.Xml;
 using System.Collections.Generic;
 
-namespace Nefdev.PptToPptx
+namespace Nedev.FileConverters.PptToPptx
 {
     public class PptxWriter : IDisposable
     {

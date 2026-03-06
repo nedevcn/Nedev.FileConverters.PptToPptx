@@ -1,0 +1,38 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <!-- multi-target for library consumers and CLI executable -->
+    <TargetFrameworks>net8.0;netstandard2.1</TargetFrameworks>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+  </PropertyGroup>
+
+  <!-- this is a pure library; output type is automatically Library for all target frameworks -->
+
+  <!-- NuGet metadata -->
+  <PropertyGroup>
+    <PackageId>Nedev.FileConverters.PptToPptx</PackageId>
+    <Title>Nedev FileConverters PPT to PPTX</Title>
+    <Description>Library for converting legacy `.ppt` files to modern `.pptx`/`.pptm` formats.</Description>
+    <Authors>Nedev</Authors>
+    <PackageVersion>1.0.0</PackageVersion>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <RepositoryUrl>https://github.com/yourorg/Nedev.FileConverters.PptToPptx</RepositoryUrl>
+    <PackageTags>ppt pptx converter ole</PackageTags>
+    <GeneratePackageOnBuild>true</GeneratePackageOnBuild>
+  </PropertyGroup>
+
+
+  <ItemGroup>
+    <PackageReference Include="System.Text.Encoding.CodePages" Version="8.0.0" />
+    <PackageReference Include="Nedev.FileConverters.Core" Version="0.1.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="..\..\README.md" Pack="true" PackagePath="" />
+    <None Include="..\..\LICENSE" Pack="true" PackagePath="" />
+  </ItemGroup>
+
+</Project>

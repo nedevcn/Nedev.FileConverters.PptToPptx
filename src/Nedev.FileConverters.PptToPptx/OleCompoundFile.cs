@@ -2,7 +2,7 @@ using System;
 using System.IO;
 using System.Collections.Generic;
 
-namespace Nefdev.PptToPptx
+namespace Nedev.FileConverters.PptToPptx
 {
     public class OleCompoundFile
     {

@@ -1,6 +1,6 @@
 using System;
 
-namespace Nefdev.PptToPptx
+namespace Nedev.FileConverters.PptToPptx
 {
     public sealed class ConversionOptions
     {

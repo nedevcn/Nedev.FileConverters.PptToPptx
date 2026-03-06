@@ -1,0 +1,28 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+
+    <OutputType>Exe</OutputType>
+    <PackAsTool>true</PackAsTool>
+    <ToolCommandName>ppt2pptx</ToolCommandName>
+
+    <PackageId>Nedev.FileConverters.PptToPptx.Cli</PackageId>
+    <Title>Nedev FileConverters PPTX CLI</Title>
+    <Description>Command-line tool for converting legacy PPT files to PPTX using the Nedev.FileConverters.PptToPptx library.</Description>
+    <Authors>Nedev</Authors>
+    <PackageVersion>1.0.0</PackageVersion>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <RepositoryUrl>https://github.com/yourorg/Nedev.FileConverters.PptToPptx</RepositoryUrl>
+    <GeneratePackageOnBuild>true</GeneratePackageOnBuild>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Nedev.FileConverters.PptToPptx\Nedev.FileConverters.PptToPptx.csproj" />
+    <PackageReference Include="System.Text.Encoding.CodePages" Version="8.0.0" />
+  </ItemGroup>
+
+</Project>

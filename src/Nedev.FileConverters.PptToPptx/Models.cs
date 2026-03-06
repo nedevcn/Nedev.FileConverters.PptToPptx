@@ -1,4 +1,4 @@
-namespace Nefdev.PptToPptx
+namespace Nedev.FileConverters.PptToPptx
 {
     public class Presentation
     {

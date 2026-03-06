@@ -1,7 +1,7 @@
 using System;
 using System.IO;
 
-namespace Nefdev.PptToPptx
+namespace Nedev.FileConverters.PptToPptx
 {
     public class PptToPptxConverter
     {

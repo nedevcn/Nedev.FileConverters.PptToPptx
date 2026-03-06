@@ -2,7 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Text;
 
-namespace Nefdev.PptToPptx
+namespace Nedev.FileConverters.PptToPptx
 {
     /// <summary>
     /// Handles BIFF strings spanning across multiple CONTINUE (0x003C) records
