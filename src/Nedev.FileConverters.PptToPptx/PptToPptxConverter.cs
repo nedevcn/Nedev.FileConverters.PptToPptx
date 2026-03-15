@@ -1,4 +1,5 @@
 using System;
+using System.Diagnostics;
 using System.IO;
 using System.Threading;
 using System.Threading.Tasks;
@@ -47,7 +48,7 @@ namespace Nedev.FileConverters.PptToPptx
         /// <exception cref="OperationCanceledException">Thrown when the operation is canceled.</exception>
         public static void Convert(string pptPath, string pptxPath, ConversionOptions? options, CancellationToken cancellationToken)
         {
-            ValidatePaths(pptPath, pptxPath);
+            ValidatePaths(pptPath, pptxPath, options);
 
             var outDir = Path.GetDirectoryName(pptxPath);
             if (!string.IsNullOrEmpty(outDir))
@@ -67,6 +68,9 @@ namespace Nedev.FileConverters.PptToPptx
                 {
                     presentation = pptReader.ReadPresentation(cancellationToken);
                 }
+
+                // Validate presentation limits
+                ValidatePresentation(presentation, options);
 
                 cancellationToken.ThrowIfCancellationRequested();
                 options?.ReportProgress(ConversionPhase.ProcessingStructure, 30, $"Found {presentation.Slides.Count} slides...", 0, presentation.Slides.Count);
@@ -88,10 +92,52 @@ namespace Nedev.FileConverters.PptToPptx
                 options?.ReportProgress(ConversionPhase.Failed, 0, "Conversion canceled.");
                 throw;
             }
+            catch (PptConversionException)
+            {
+                options?.ReportProgress(ConversionPhase.Failed, 0, "Conversion failed.");
+                throw;
+            }
             catch (Exception ex)
             {
                 options?.ReportProgress(ConversionPhase.Failed, 0, $"Conversion failed: {ex.Message}");
                 throw new PptConversionException($"Failed to convert '{pptPath}' to '{pptxPath}'.", ConversionPhase.Failed, ex, pptPath);
+            }
+        }
+
+        /// <summary>
+        /// Converts a .ppt file to .pptx format and returns detailed result information.
+        /// </summary>
+        /// <param name="pptPath">The path to the input .ppt file.</param>
+        /// <param name="pptxPath">The path for the output .pptx file.</param>
+        /// <param name="options">Optional conversion options and callbacks.</param>
+        /// <param name="cancellationToken">Cancellation token to cancel the operation.</param>
+        /// <returns>A <see cref="ConversionResult"/> containing conversion details.</returns>
+        public static ConversionResult ConvertWithResult(string pptPath, string pptxPath, ConversionOptions? options = null, CancellationToken cancellationToken = default)
+        {
+            var stopwatch = Stopwatch.StartNew();
+            var inputFileSize = new FileInfo(pptPath).Length;
+            
+            try
+            {
+                Convert(pptPath, pptxPath, options, cancellationToken);
+                
+                stopwatch.Stop();
+                var outputFileSize = new FileInfo(pptxPath).Length;
+                
+                // Note: These counts would need to be tracked during conversion
+                // For now, return basic information
+                return ConversionResult.SuccessResult(
+                    stopwatch.Elapsed,
+                    slideCount: 0,  // Would need to track during conversion
+                    imageCount: 0,  // Would need to track during conversion
+                    embeddedResourceCount: 0,  // Would need to track during conversion
+                    inputFileSize,
+                    outputFileSize);
+            }
+            catch (Exception ex)
+            {
+                stopwatch.Stop();
+                return ConversionResult.FailureResult(ex, stopwatch.Elapsed, inputFileSize: inputFileSize);
             }
         }
 
@@ -115,9 +161,62 @@ namespace Nedev.FileConverters.PptToPptx
         /// <param name="options">Optional conversion options and callbacks.</param>
         /// <param name="cancellationToken">Cancellation token to cancel the operation.</param>
         /// <returns>A task representing the asynchronous conversion operation.</returns>
-        public static Task ConvertAsync(string pptPath, string pptxPath, ConversionOptions? options, CancellationToken cancellationToken = default)
+        public static async Task ConvertAsync(string pptPath, string pptxPath, ConversionOptions? options, CancellationToken cancellationToken = default)
         {
-            return Task.Run(() => Convert(pptPath, pptxPath, options, cancellationToken), cancellationToken);
+            // Apply timeout if configured
+            if (options?.Timeout > TimeSpan.Zero)
+            {
+                using var timeoutCts = new CancellationTokenSource(options.Timeout);
+                using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, timeoutCts.Token);
+                
+                try
+                {
+                    await Task.Run(() => Convert(pptPath, pptxPath, options, linkedCts.Token), linkedCts.Token);
+                }
+                catch (OperationCanceledException) when (timeoutCts.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
+                {
+                    throw new TimeoutException($"Conversion timed out after {options.Timeout.TotalSeconds} seconds.");
+                }
+            }
+            else
+            {
+                await Task.Run(() => Convert(pptPath, pptxPath, options, cancellationToken), cancellationToken);
+            }
+        }
+
+        /// <summary>
+        /// Asynchronously converts a .ppt file to .pptx format and returns detailed result information.
+        /// </summary>
+        /// <param name="pptPath">The path to the input .ppt file.</param>
+        /// <param name="pptxPath">The path for the output .pptx file.</param>
+        /// <param name="options">Optional conversion options and callbacks.</param>
+        /// <param name="cancellationToken">Cancellation token to cancel the operation.</param>
+        /// <returns>A task that returns a <see cref="ConversionResult"/> containing conversion details.</returns>
+        public static async Task<ConversionResult> ConvertWithResultAsync(string pptPath, string pptxPath, ConversionOptions? options = null, CancellationToken cancellationToken = default)
+        {
+            var stopwatch = Stopwatch.StartNew();
+            var inputFileSize = new FileInfo(pptPath).Length;
+            
+            try
+            {
+                await ConvertAsync(pptPath, pptxPath, options, cancellationToken);
+                
+                stopwatch.Stop();
+                var outputFileSize = new FileInfo(pptxPath).Length;
+                
+                return ConversionResult.SuccessResult(
+                    stopwatch.Elapsed,
+                    slideCount: 0,
+                    imageCount: 0,
+                    embeddedResourceCount: 0,
+                    inputFileSize,
+                    outputFileSize);
+            }
+            catch (Exception ex)
+            {
+                stopwatch.Stop();
+                return ConversionResult.FailureResult(ex, stopwatch.Elapsed, inputFileSize: inputFileSize);
+            }
         }
 
         /// <summary>
@@ -195,7 +294,7 @@ namespace Nedev.FileConverters.PptToPptx
             return Task.Run(() => Convert(inputStream, outputStream, options, cancellationToken), cancellationToken);
         }
 
-        private static void ValidatePaths(string pptPath, string pptxPath)
+        private static void ValidatePaths(string pptPath, string pptxPath, ConversionOptions? options = null)
         {
             if (string.IsNullOrWhiteSpace(pptPath))
                 throw new ArgumentException("Input .ppt path must be provided.", nameof(pptPath));
@@ -207,6 +306,46 @@ namespace Nedev.FileConverters.PptToPptx
 
             if (Path.GetFullPath(pptPath).Equals(Path.GetFullPath(pptxPath), StringComparison.OrdinalIgnoreCase))
                 throw new ArgumentException("Output path must be different from input path.", nameof(pptxPath));
+
+            // 检查文件大小限制
+            if (options?.MaxInputFileSize > 0)
+            {
+                var fileInfo = new FileInfo(pptPath);
+                if (fileInfo.Length > options.MaxInputFileSize)
+                {
+                    throw new PptConversionException(
+                        $"Input file size ({fileInfo.Length} bytes) exceeds maximum allowed size ({options.MaxInputFileSize} bytes).",
+                        ConversionPhase.Initializing,
+                        pptPath);
+                }
+            }
+
+            // 检查绝对最大文件大小限制
+            var absoluteMaxFileInfo = new FileInfo(pptPath);
+            if (absoluteMaxFileInfo.Length > ConversionLimits.AbsoluteMaxInputFileSize)
+            {
+                throw new PptConversionException(
+                    $"Input file size ({absoluteMaxFileInfo.Length} bytes) exceeds absolute maximum allowed size ({ConversionLimits.AbsoluteMaxInputFileSize} bytes).",
+                    ConversionPhase.Initializing,
+                    pptPath);
+            }
+        }
+
+        private static void ValidatePresentation(Presentation presentation, ConversionOptions? options)
+        {
+            if (options?.MaxSlideCount > 0 && presentation.Slides.Count > options.MaxSlideCount)
+            {
+                throw new PptConversionException(
+                    $"Presentation contains {presentation.Slides.Count} slides, which exceeds the maximum allowed ({options.MaxSlideCount}).",
+                    ConversionPhase.ProcessingStructure);
+            }
+
+            if (options?.MaxImageCount > 0 && presentation.Images.Count > options.MaxImageCount)
+            {
+                throw new PptConversionException(
+                    $"Presentation contains {presentation.Images.Count} images, which exceeds the maximum allowed ({options.MaxImageCount}).",
+                    ConversionPhase.ProcessingStructure);
+            }
         }
     }
 }

@@ -104,6 +104,30 @@ namespace Nedev.FileConverters.PptToPptx
         public int? BiffAnsiCodePageOverride { get; set; }
 
         /// <summary>
+        /// Maximum allowed input file size in bytes. Default is 100 MB.
+        /// Set to 0 or negative to disable limit (not recommended).
+        /// </summary>
+        public long MaxInputFileSize { get; set; } = ConversionLimits.DefaultMaxInputFileSize;
+
+        /// <summary>
+        /// Maximum allowed number of slides. Default is 1000.
+        /// Set to 0 or negative to disable limit.
+        /// </summary>
+        public int MaxSlideCount { get; set; } = ConversionLimits.DefaultMaxSlideCount;
+
+        /// <summary>
+        /// Maximum allowed number of images. Default is 5000.
+        /// Set to 0 or negative to disable limit.
+        /// </summary>
+        public int MaxImageCount { get; set; } = ConversionLimits.DefaultMaxImageCount;
+
+        /// <summary>
+        /// Maximum time allowed for the conversion operation. Default is 10 minutes.
+        /// Set to <see cref="TimeSpan.Zero"/> or negative to disable timeout.
+        /// </summary>
+        public TimeSpan Timeout { get; set; } = TimeSpan.FromMinutes(10);
+
+        /// <summary>
         /// Reports a progress update if a progress callback is configured.
         /// </summary>
         public void ReportProgress(ConversionPhase phase, int percentComplete, string message, int slidesProcessed = 0, int totalSlides = 0)
