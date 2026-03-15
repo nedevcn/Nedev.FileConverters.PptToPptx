@@ -3,6 +3,7 @@ using System.IO;
 using System.IO.Compression;
 using System.Xml;
 using System.Collections.Generic;
+using System.Threading;
 
 namespace Nedev.FileConverters.PptToPptx
 {
@@ -11,9 +12,11 @@ namespace Nedev.FileConverters.PptToPptx
     /// </summary>
     public partial class PptxWriter : IDisposable
     {
-        private readonly string _outputPath;
+        private readonly string? _outputPath;
+        private readonly Stream? _outputStream;
         private readonly ConversionOptions? _options;
         private readonly Action<string>? _log;
+        private readonly bool _ownsStream;
         private readonly Dictionary<Shape, int> _chartPartIdMap = new Dictionary<Shape, int>();
 
         /// <summary>
@@ -28,11 +31,48 @@ namespace Nedev.FileConverters.PptToPptx
                 throw new ArgumentException("Output .pptx/.pptm path must be provided.", nameof(path));
 
             _outputPath = path;
+            _outputStream = null;
+            _ownsStream = false;
             _options = options;
             _log = options?.Log;
         }
-        
+
+        /// <summary>
+        /// Initializes a new instance of the <see cref="PptxWriter"/> class.
+        /// </summary>
+        /// <param name="stream">The output stream for the .pptx data.</param>
+        /// <param name="options">Optional conversion options.</param>
+        /// <exception cref="ArgumentNullException">Thrown when stream is null.</exception>
+        /// <exception cref="ArgumentException">Thrown when stream is not writable.</exception>
+        public PptxWriter(Stream stream, ConversionOptions? options = null)
+        {
+            if (stream == null)
+                throw new ArgumentNullException(nameof(stream));
+            if (!stream.CanWrite)
+                throw new ArgumentException("Stream must be writable.", nameof(stream));
+
+            _outputPath = null;
+            _outputStream = stream;
+            _ownsStream = false;
+            _options = options;
+            _log = options?.Log;
+        }
+
+        /// <summary>
+        /// Writes the presentation to the output.
+        /// </summary>
+        /// <param name="presentation">The presentation to write.</param>
         public void WritePresentation(Presentation presentation)
+        {
+            WritePresentation(presentation, CancellationToken.None);
+        }
+
+        /// <summary>
+        /// Writes the presentation to the output with cancellation support.
+        /// </summary>
+        /// <param name="presentation">The presentation to write.</param>
+        /// <param name="cancellationToken">Cancellation token to cancel the operation.</param>
+        public void WritePresentation(Presentation presentation, CancellationToken cancellationToken)
         {
             if (presentation == null) throw new ArgumentNullException(nameof(presentation));
             if (presentation.SlideWidth <= 0) presentation.SlideWidth = 9144000;
@@ -49,6 +89,7 @@ namespace Nedev.FileConverters.PptToPptx
                     presentation.Slides.Add(new Slide { Index = 1 });
                 }
 
+                cancellationToken.ThrowIfCancellationRequested();
                 BuildChartPartMap(presentation);
                 _options?.ReportProgress(ConversionPhase.Writing, 50, "Creating directory structure...");
                 
@@ -57,21 +98,26 @@ namespace Nedev.FileConverters.PptToPptx
                 WritePackageRelationships(tempDir);
                 
                 // 写入图片资源
+                cancellationToken.ThrowIfCancellationRequested();
                 _options?.ReportProgress(ConversionPhase.Writing, 55, $"Writing {presentation.Images.Count} images...");
                 WriteMediaFiles(tempDir, presentation);
                 WriteEmbeddingFiles(tempDir, presentation);
                 
+                cancellationToken.ThrowIfCancellationRequested();
                 WritePresentationXml(tempDir, presentation);
                 WritePresentationRelationships(tempDir, presentation);
                 
                 // 写入幻灯片并报告进度
+                cancellationToken.ThrowIfCancellationRequested();
                 _options?.ReportProgress(ConversionPhase.ProcessingSlides, 60, $"Writing {presentation.Slides.Count} slides...", 0, presentation.Slides.Count);
                 WriteSlidesXml(tempDir, presentation, (processed, total) =>
                 {
+                    cancellationToken.ThrowIfCancellationRequested();
                     int percent = 60 + (processed * 25 / total);
                     _options?.ReportProgress(ConversionPhase.ProcessingSlides, percent, $"Writing slide {processed} of {total}...", processed, total);
                 });
                 
+                cancellationToken.ThrowIfCancellationRequested();
                 WriteSlideLayouts(tempDir, presentation);
                 WriteSlideLayoutRelationships(tempDir, presentation);
                 WriteSlideMasters(tempDir, presentation);
@@ -82,18 +128,30 @@ namespace Nedev.FileConverters.PptToPptx
                 
                 if (presentation.VbaProject?.ProjectData != null && presentation.VbaProject.ProjectData.Length > 0)
                 {
+                    cancellationToken.ThrowIfCancellationRequested();
                     _options?.ReportProgress(ConversionPhase.Writing, 88, "Writing VBA project...");
                     WriteVbaProject(tempDir, presentation.VbaProject);
                 }
                 
+                cancellationToken.ThrowIfCancellationRequested();
                 _options?.ReportProgress(ConversionPhase.Writing, 90, "Packaging PPTX file...");
-                PackageAsPptx(tempDir, _outputPath);
                 
-                _log?.Invoke($"PPTX file written to: {_outputPath}");
+                if (_outputStream != null)
+                {
+                    // 写入到流
+                    PackageAsPptxToStream(tempDir, _outputStream);
+                    _log?.Invoke("PPTX data written to stream.");
+                }
+                else
+                {
+                    // 写入到文件
+                    PackageAsPptx(tempDir, _outputPath!);
+                    _log?.Invoke($"PPTX file written to: {_outputPath}");
+                }
             }
             finally
             {
-                if (ShouldKeepTempFiles())
+                if (ShouldKeepTempFiles() && _outputPath != null)
                 {
                     string outDir = Path.GetDirectoryName(_outputPath);
                     if (string.IsNullOrEmpty(outDir))
@@ -2387,10 +2445,23 @@ namespace Nedev.FileConverters.PptToPptx
         {
             if (File.Exists(targetPath))
                 File.Delete(targetPath);
-            
+
             using var zipArchive = ZipFile.Open(targetPath, ZipArchiveMode.Create);
             var files = Directory.GetFiles(sourceDir, "*.*", SearchOption.AllDirectories);
-            
+
+            foreach (var file in files)
+            {
+                // 使用正斜杠作为 ZIP 路径分隔符
+                string relativePath = Path.GetRelativePath(sourceDir, file).Replace('\\', '/');
+                zipArchive.CreateEntryFromFile(file, relativePath, CompressionLevel.Optimal);
+            }
+        }
+
+        private void PackageAsPptxToStream(string sourceDir, Stream targetStream)
+        {
+            using var zipArchive = new ZipArchive(targetStream, ZipArchiveMode.Create, leaveOpen: true);
+            var files = Directory.GetFiles(sourceDir, "*.*", SearchOption.AllDirectories);
+
             foreach (var file in files)
             {
                 // 使用正斜杠作为 ZIP 路径分隔符
@@ -2464,8 +2535,13 @@ namespace Nedev.FileConverters.PptToPptx
         
         public void Dispose()
         {
+            // 如果拥有流，则释放它
+            if (_ownsStream && _outputStream != null)
+            {
+                _outputStream.Dispose();
+            }
         }
-        
+
         #endregion
     }
 }

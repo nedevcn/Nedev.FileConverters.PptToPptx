@@ -1,5 +1,7 @@
 using System;
 using System.IO;
+using System.Threading;
+using System.Threading.Tasks;
 
 namespace Nedev.FileConverters.PptToPptx
 {
@@ -17,7 +19,7 @@ namespace Nedev.FileConverters.PptToPptx
         /// <exception cref="FileNotFoundException">Thrown when the input file does not exist.</exception>
         public static void Convert(string pptPath, string pptxPath)
         {
-            Convert(pptPath, pptxPath, null);
+            Convert(pptPath, pptxPath, null, CancellationToken.None);
         }
 
         /// <summary>
@@ -30,6 +32,171 @@ namespace Nedev.FileConverters.PptToPptx
         /// <exception cref="FileNotFoundException">Thrown when the input file does not exist.</exception>
         public static void Convert(string pptPath, string pptxPath, ConversionOptions? options)
         {
+            Convert(pptPath, pptxPath, options, CancellationToken.None);
+        }
+
+        /// <summary>
+        /// Converts a .ppt file to .pptx format with optional configuration and cancellation support.
+        /// </summary>
+        /// <param name="pptPath">The path to the input .ppt file.</param>
+        /// <param name="pptxPath">The path for the output .pptx file.</param>
+        /// <param name="options">Optional conversion options and callbacks.</param>
+        /// <param name="cancellationToken">Cancellation token to cancel the operation.</param>
+        /// <exception cref="ArgumentException">Thrown when path arguments are invalid.</exception>
+        /// <exception cref="FileNotFoundException">Thrown when the input file does not exist.</exception>
+        /// <exception cref="OperationCanceledException">Thrown when the operation is canceled.</exception>
+        public static void Convert(string pptPath, string pptxPath, ConversionOptions? options, CancellationToken cancellationToken)
+        {
+            ValidatePaths(pptPath, pptxPath);
+
+            var outDir = Path.GetDirectoryName(pptxPath);
+            if (!string.IsNullOrEmpty(outDir))
+                Directory.CreateDirectory(outDir);
+
+            cancellationToken.ThrowIfCancellationRequested();
+            options?.ReportProgress(ConversionPhase.Initializing, 0, "Starting conversion...");
+
+            try
+            {
+                Presentation presentation;
+
+                // Read phase
+                cancellationToken.ThrowIfCancellationRequested();
+                options?.ReportProgress(ConversionPhase.Reading, 10, "Reading PPT file...");
+                using (var pptReader = new PptReader(pptPath, options))
+                {
+                    presentation = pptReader.ReadPresentation(cancellationToken);
+                }
+
+                cancellationToken.ThrowIfCancellationRequested();
+                options?.ReportProgress(ConversionPhase.ProcessingStructure, 30, $"Found {presentation.Slides.Count} slides...", 0, presentation.Slides.Count);
+
+                // Write phase
+                cancellationToken.ThrowIfCancellationRequested();
+                options?.ReportProgress(ConversionPhase.Writing, 50, "Writing PPTX file...");
+                using (var pptxWriter = new PptxWriter(pptxPath, options))
+                {
+                    pptxWriter.WritePresentation(presentation, cancellationToken);
+                }
+
+                cancellationToken.ThrowIfCancellationRequested();
+                options?.ReportProgress(ConversionPhase.Finalizing, 90, "Finalizing...");
+                options?.ReportProgress(ConversionPhase.Completed, 100, "Conversion completed successfully.", presentation.Slides.Count, presentation.Slides.Count);
+            }
+            catch (OperationCanceledException)
+            {
+                options?.ReportProgress(ConversionPhase.Failed, 0, "Conversion canceled.");
+                throw;
+            }
+            catch (Exception ex)
+            {
+                options?.ReportProgress(ConversionPhase.Failed, 0, $"Conversion failed: {ex.Message}");
+                throw new PptConversionException($"Failed to convert '{pptPath}' to '{pptxPath}'.", ConversionPhase.Failed, ex, pptPath);
+            }
+        }
+
+        /// <summary>
+        /// Asynchronously converts a .ppt file to .pptx format.
+        /// </summary>
+        /// <param name="pptPath">The path to the input .ppt file.</param>
+        /// <param name="pptxPath">The path for the output .pptx file.</param>
+        /// <param name="cancellationToken">Cancellation token to cancel the operation.</param>
+        /// <returns>A task representing the asynchronous conversion operation.</returns>
+        public static Task ConvertAsync(string pptPath, string pptxPath, CancellationToken cancellationToken = default)
+        {
+            return ConvertAsync(pptPath, pptxPath, null, cancellationToken);
+        }
+
+        /// <summary>
+        /// Asynchronously converts a .ppt file to .pptx format with optional configuration.
+        /// </summary>
+        /// <param name="pptPath">The path to the input .ppt file.</param>
+        /// <param name="pptxPath">The path for the output .pptx file.</param>
+        /// <param name="options">Optional conversion options and callbacks.</param>
+        /// <param name="cancellationToken">Cancellation token to cancel the operation.</param>
+        /// <returns>A task representing the asynchronous conversion operation.</returns>
+        public static Task ConvertAsync(string pptPath, string pptxPath, ConversionOptions? options, CancellationToken cancellationToken = default)
+        {
+            return Task.Run(() => Convert(pptPath, pptxPath, options, cancellationToken), cancellationToken);
+        }
+
+        /// <summary>
+        /// Converts a .ppt from input stream to .pptx output stream.
+        /// </summary>
+        /// <param name="inputStream">The input stream containing the .ppt data.</param>
+        /// <param name="outputStream">The output stream where .pptx data will be written.</param>
+        /// <param name="options">Optional conversion options and callbacks.</param>
+        /// <param name="cancellationToken">Cancellation token to cancel the operation.</param>
+        /// <exception cref="ArgumentNullException">Thrown when input or output stream is null.</exception>
+        /// <exception cref="ArgumentException">Thrown when streams are not readable/writable.</exception>
+        public static void Convert(Stream inputStream, Stream outputStream, ConversionOptions? options = null, CancellationToken cancellationToken = default)
+        {
+            if (inputStream == null)
+                throw new ArgumentNullException(nameof(inputStream));
+            if (outputStream == null)
+                throw new ArgumentNullException(nameof(outputStream));
+            if (!inputStream.CanRead)
+                throw new ArgumentException("Input stream must be readable.", nameof(inputStream));
+            if (!outputStream.CanWrite)
+                throw new ArgumentException("Output stream must be writable.", nameof(outputStream));
+
+            cancellationToken.ThrowIfCancellationRequested();
+            options?.ReportProgress(ConversionPhase.Initializing, 0, "Starting conversion...");
+
+            try
+            {
+                Presentation presentation;
+
+                // Read phase
+                cancellationToken.ThrowIfCancellationRequested();
+                options?.ReportProgress(ConversionPhase.Reading, 10, "Reading PPT stream...");
+                using (var pptReader = new PptReader(inputStream, options))
+                {
+                    presentation = pptReader.ReadPresentation(cancellationToken);
+                }
+
+                cancellationToken.ThrowIfCancellationRequested();
+                options?.ReportProgress(ConversionPhase.ProcessingStructure, 30, $"Found {presentation.Slides.Count} slides...", 0, presentation.Slides.Count);
+
+                // Write phase
+                cancellationToken.ThrowIfCancellationRequested();
+                options?.ReportProgress(ConversionPhase.Writing, 50, "Writing PPTX stream...");
+                using (var pptxWriter = new PptxWriter(outputStream, options))
+                {
+                    pptxWriter.WritePresentation(presentation, cancellationToken);
+                }
+
+                cancellationToken.ThrowIfCancellationRequested();
+                options?.ReportProgress(ConversionPhase.Finalizing, 90, "Finalizing...");
+                options?.ReportProgress(ConversionPhase.Completed, 100, "Conversion completed successfully.", presentation.Slides.Count, presentation.Slides.Count);
+            }
+            catch (OperationCanceledException)
+            {
+                options?.ReportProgress(ConversionPhase.Failed, 0, "Conversion canceled.");
+                throw;
+            }
+            catch (Exception ex)
+            {
+                options?.ReportProgress(ConversionPhase.Failed, 0, $"Conversion failed: {ex.Message}");
+                throw new PptConversionException("Failed to convert stream.", ConversionPhase.Failed, ex);
+            }
+        }
+
+        /// <summary>
+        /// Asynchronously converts a .ppt from input stream to .pptx output stream.
+        /// </summary>
+        /// <param name="inputStream">The input stream containing the .ppt data.</param>
+        /// <param name="outputStream">The output stream where .pptx data will be written.</param>
+        /// <param name="options">Optional conversion options and callbacks.</param>
+        /// <param name="cancellationToken">Cancellation token to cancel the operation.</param>
+        /// <returns>A task representing the asynchronous conversion operation.</returns>
+        public static Task ConvertAsync(Stream inputStream, Stream outputStream, ConversionOptions? options = null, CancellationToken cancellationToken = default)
+        {
+            return Task.Run(() => Convert(inputStream, outputStream, options, cancellationToken), cancellationToken);
+        }
+
+        private static void ValidatePaths(string pptPath, string pptxPath)
+        {
             if (string.IsNullOrWhiteSpace(pptPath))
                 throw new ArgumentException("Input .ppt path must be provided.", nameof(pptPath));
             if (string.IsNullOrWhiteSpace(pptxPath))
@@ -40,41 +207,6 @@ namespace Nedev.FileConverters.PptToPptx
 
             if (Path.GetFullPath(pptPath).Equals(Path.GetFullPath(pptxPath), StringComparison.OrdinalIgnoreCase))
                 throw new ArgumentException("Output path must be different from input path.", nameof(pptxPath));
-
-            var outDir = Path.GetDirectoryName(pptxPath);
-            if (!string.IsNullOrEmpty(outDir))
-                Directory.CreateDirectory(outDir);
-
-            options?.ReportProgress(ConversionPhase.Initializing, 0, "Starting conversion...");
-
-            try
-            {
-                Presentation presentation;
-
-                // Read phase
-                options?.ReportProgress(ConversionPhase.Reading, 10, "Reading PPT file...");
-                using (var pptReader = new PptReader(pptPath, options))
-                {
-                    presentation = pptReader.ReadPresentation();
-                }
-
-                options?.ReportProgress(ConversionPhase.ProcessingStructure, 30, $"Found {presentation.Slides.Count} slides...", 0, presentation.Slides.Count);
-
-                // Write phase
-                options?.ReportProgress(ConversionPhase.Writing, 50, "Writing PPTX file...");
-                using (var pptxWriter = new PptxWriter(pptxPath, options))
-                {
-                    pptxWriter.WritePresentation(presentation);
-                }
-
-                options?.ReportProgress(ConversionPhase.Finalizing, 90, "Finalizing...");
-                options?.ReportProgress(ConversionPhase.Completed, 100, "Conversion completed successfully.", presentation.Slides.Count, presentation.Slides.Count);
-            }
-            catch (Exception ex)
-            {
-                options?.ReportProgress(ConversionPhase.Failed, 0, $"Conversion failed: {ex.Message}");
-                throw;
-            }
         }
     }
 }

@@ -4,6 +4,7 @@ using System.Linq;
 using System.Text;
 using System.Collections.Generic;
 using System.Globalization;
+using System.Threading;
 
 namespace Nedev.FileConverters.PptToPptx
 {
@@ -15,6 +16,7 @@ namespace Nedev.FileConverters.PptToPptx
         private readonly Stream _stream;
         private readonly ConversionOptions? _options;
         private readonly Action<string>? _log;
+        private readonly bool _ownsStream;
         private byte[]? _picturesData;
         private OleCompoundFile? _oleFile;
 
@@ -41,11 +43,46 @@ namespace Nedev.FileConverters.PptToPptx
                 throw new FileNotFoundException("Input .ppt file not found.", path);
 
             _stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
+            _ownsStream = true;
             _options = options;
             _log = options?.Log;
         }
-        
+
+        /// <summary>
+        /// Initializes a new instance of the <see cref="PptReader"/> class.
+        /// </summary>
+        /// <param name="stream">The stream containing the .ppt data.</param>
+        /// <param name="options">Optional conversion options.</param>
+        /// <exception cref="ArgumentNullException">Thrown when stream is null.</exception>
+        /// <exception cref="ArgumentException">Thrown when stream is not readable.</exception>
+        public PptReader(Stream stream, ConversionOptions? options = null)
+        {
+            if (stream == null)
+                throw new ArgumentNullException(nameof(stream));
+            if (!stream.CanRead)
+                throw new ArgumentException("Stream must be readable.", nameof(stream));
+
+            _stream = stream;
+            _ownsStream = false;
+            _options = options;
+            _log = options?.Log;
+        }
+
+        /// <summary>
+        /// Reads and parses the presentation from the input.
+        /// </summary>
+        /// <returns>The parsed presentation object.</returns>
         public Presentation ReadPresentation()
+        {
+            return ReadPresentation(CancellationToken.None);
+        }
+
+        /// <summary>
+        /// Reads and parses the presentation from the input with cancellation support.
+        /// </summary>
+        /// <param name="cancellationToken">Cancellation token to cancel the operation.</param>
+        /// <returns>The parsed presentation object.</returns>
+        public Presentation ReadPresentation(CancellationToken cancellationToken)
         {
             EncodingRegistration.EnsureCodePages();
 
@@ -59,6 +96,7 @@ namespace Nedev.FileConverters.PptToPptx
             var presentation = new Presentation();
             
             // 使用 OLE Compound File 解析器
+            cancellationToken.ThrowIfCancellationRequested();
             _options?.ReportProgress(ConversionPhase.Reading, 10, "Parsing OLE container...");
             var oleFile = new OleCompoundFile(_stream);
             _oleFile = oleFile;
@@ -67,10 +105,11 @@ namespace Nedev.FileConverters.PptToPptx
             // 读取 PowerPoint 文档流
             var pptStream = oleFile.GetStream("PowerPoint Document");
             if (pptStream == null)
-                throw new InvalidDataException("OLE container does not contain a 'PowerPoint Document' stream.");
+                throw new InvalidPptFormatException("OLE container does not contain a 'PowerPoint Document' stream.");
 
             using (pptStream)
             {
+                cancellationToken.ThrowIfCancellationRequested();
                 byte[] pptData = ReadAllBytes(pptStream);
                     
                     // 先尝试通过 Current User 找到 UserEdit 链
@@ -85,10 +124,12 @@ namespace Nedev.FileConverters.PptToPptx
                     }
                     
                     // 读取 Persist 映射表
+                    cancellationToken.ThrowIfCancellationRequested();
                     _options?.ReportProgress(ConversionPhase.Reading, 15, "Building persist directory...");
                     var persistDirectory = BuildPersistDirectory(pptData, userEditOffset);
                     
                     // 读取 Pictures 流
+                    cancellationToken.ThrowIfCancellationRequested();
                     _options?.ReportProgress(ConversionPhase.ExtractingMedia, 20, "Extracting media...");
                     var picturesStream = oleFile.GetStream("Pictures");
                     if (picturesStream != null)
@@ -100,10 +141,12 @@ namespace Nedev.FileConverters.PptToPptx
                         }
                     }
 
+                    cancellationToken.ThrowIfCancellationRequested();
                     // 提取所有全局超链接
                     GlobalScanForHyperlinks(pptData);
 
                     // 解析 Document 和 Slides
+                    cancellationToken.ThrowIfCancellationRequested();
                     _options?.ReportProgress(ConversionPhase.ProcessingStructure, 25, "Parsing document structure...");
                     ParsePptData(pptData, presentation, persistDirectory);
                     
@@ -2595,7 +2638,10 @@ namespace Nedev.FileConverters.PptToPptx
         
         public void Dispose()
         {
-            _stream.Dispose();
+            if (_ownsStream)
+            {
+                _stream.Dispose();
+            }
         }
     }
 }

@@ -106,7 +106,7 @@ namespace Nedev.FileConverters.PptToPptx
         /// <summary>
         /// Reports a progress update if a progress callback is configured.
         /// </summary>
-        internal void ReportProgress(ConversionPhase phase, int percentComplete, string message, int slidesProcessed = 0, int totalSlides = 0)
+        public void ReportProgress(ConversionPhase phase, int percentComplete, string message, int slidesProcessed = 0, int totalSlides = 0)
         {
             Progress?.Invoke(new ConversionProgress(phase, percentComplete, message, slidesProcessed, totalSlides));
         }
@@ -114,7 +114,7 @@ namespace Nedev.FileConverters.PptToPptx
         /// <summary>
         /// Logs a message if a log callback is configured.
         /// </summary>
-        internal void LogMessage(string message)
+        public void LogMessage(string message)
         {
             Log?.Invoke(message);
         }
